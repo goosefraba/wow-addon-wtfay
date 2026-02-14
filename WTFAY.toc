@@ -1,7 +1,7 @@
 ## Interface: 20505
 ## Title: WTFAY - Who The F* Are You?
 ## Notes: Track, rate, and remember every player you encounter.
-## Author: Bernhard
+## Author: goosefraba
 ## Version: 0.4.0
 ## SavedVariables: WTFAYDB
 
