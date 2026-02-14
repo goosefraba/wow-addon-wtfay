@@ -1,9 +1,9 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.3.0
+-- WTFAY - Who The F* Are You?   v0.4.0
 -- Database, slash commands, browse UI, rating, notes
 ----------------------------------------------------------------------
 local ADDON_NAME = "WTFAY"
-local ADDON_VERSION = "0.3.0"
+local ADDON_VERSION = "0.4.0"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
@@ -65,11 +65,39 @@ local SEED_PLAYERS = {
     { name="Zugzug",       realm="Shazzrah",   class="Warrior", race="Orc",      level=64, rating= 0, note="",                                       source="manual"  },
 }
 
+-- Alert sound choices (name, soundID for normal, soundID for blacklisted)
+local ALERT_SOUNDS = {
+    { name = "Quest Complete",  normal = 1516,  blacklist = 8959 },
+    { name = "Ready Check",     normal = 8960,  blacklist = 8959 },
+    { name = "Raid Warning",    normal = 8959,  blacklist = 8959 },
+    { name = "Map Ping",        normal = 3175,  blacklist = 8959 },
+    { name = "Auction Open",    normal = 5274,  blacklist = 8959 },
+    { name = "PvP Enter Queue", normal = 8458,  blacklist = 8959 },
+    { name = "Loot Coin",       normal = 120,   blacklist = 8959 },
+}
+
 -- Default settings
 local SETTINGS_DEFAULTS = {
-    debug     = false,
-    autoTrack = true,
+    debug            = false,
+    autoTrack        = true,
+    knownAlerts      = true,   -- Notify when known players join your group
+    alertPopup       = true,   -- Also show a popup panel (not just chat)
+    alertSound       = true,   -- Play a sound when the alert popup appears
+    alertSoundChoice = 1,      -- Index into ALERT_SOUNDS (default: Quest Complete)
+    alertSkipGuild   = true,   -- Skip guild members from known player alerts
 }
+
+-- Play the user's chosen alert sound (isBlacklist = true for blacklisted warning)
+local function PlayAlertSound(isBlacklist)
+    if not db or not db.settings or not db.settings.alertSound then return end
+    local idx = db.settings.alertSoundChoice or 1
+    local choice = ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]
+    if isBlacklist then
+        PlaySound(choice.blacklist)
+    else
+        PlaySound(choice.normal)
+    end
+end
 
 local function InitDB()
     if not WTFAYDB then WTFAYDB = {} end
@@ -1009,7 +1037,7 @@ local settingsPanel = {}
 
 do
     local sp = CreateFrame("Frame", "WTFAYSettingsPanel", UIParent)
-    sp:SetSize(280, 240)
+    sp:SetSize(280, 470)
     sp:SetPoint("CENTER", UIParent, "CENTER", 0, 60)
     sp:SetFrameStrata("FULLSCREEN_DIALOG")
     sp:SetMovable(true)
@@ -1107,8 +1135,95 @@ do
         end
     )
 
+    -- Toggle: Known Player Alerts
+    local knownAlertsToggle = CreateToggle(sp, -138,
+        "Known Player Alerts",
+        "Show a chat notification when known players join your group.",
+        function() return db and db.settings and db.settings.knownAlerts or false end,
+        function(val)
+            if db and db.settings then db.settings.knownAlerts = val end
+            P("Known player alerts: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Toggle: Alert Popup Panel
+    local alertPopupToggle = CreateToggle(sp, -186,
+        "Alert Popup Panel",
+        "Also show a popup panel with known players (not just chat).",
+        function() return db and db.settings and db.settings.alertPopup or false end,
+        function(val)
+            if db and db.settings then db.settings.alertPopup = val end
+            P("Alert popup: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Toggle: Alert Sound
+    local alertSoundToggle = CreateToggle(sp, -234,
+        "Alert Sound",
+        "Play a sound when the known player alert appears.",
+        function() return db and db.settings and db.settings.alertSound or false end,
+        function(val)
+            if db and db.settings then db.settings.alertSound = val end
+            P("Alert sound: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Sound picker label + dropdown + preview button
+    local soundLabel = sp:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    soundLabel:SetPoint("TOPLEFT", sp, "TOPLEFT", 22, -268)
+    soundLabel:SetText("|cFFBBBBBBSound:|r")
+
+    local soundDropdown = CreateFrame("Frame", "WTFAYSoundDropdownStandalone", sp, "UIDropDownMenuTemplate")
+    soundDropdown:SetPoint("LEFT", soundLabel, "RIGHT", -8, -2)
+    UIDropDownMenu_SetWidth(soundDropdown, 130)
+
+    local function SoundDropdown_Init(self, level)
+        for i, s in ipairs(ALERT_SOUNDS) do
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = s.name
+            info.value = i
+            info.func = function()
+                if db and db.settings then db.settings.alertSoundChoice = i end
+                UIDropDownMenu_SetSelectedValue(soundDropdown, i)
+                UIDropDownMenu_SetText(soundDropdown, s.name)
+                -- Preview the sound
+                PlaySound(s.normal)
+            end
+            info.checked = (db and db.settings and db.settings.alertSoundChoice == i)
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end
+    UIDropDownMenu_Initialize(soundDropdown, SoundDropdown_Init)
+
+    local previewBtn = CreateFrame("Button", nil, sp, "UIPanelButtonTemplate")
+    previewBtn:SetSize(40, 22)
+    previewBtn:SetPoint("LEFT", soundDropdown, "RIGHT", -4, 2)
+    previewBtn:SetText("Test")
+    previewBtn:SetScript("OnClick", function()
+        local idx = db and db.settings and db.settings.alertSoundChoice or 1
+        local choice = ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]
+        PlaySound(choice.normal)
+    end)
+    previewBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Preview sound")
+        GameTooltip:Show()
+    end)
+    previewBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    -- Toggle: Skip Guild Members in Alerts
+    local skipGuildToggle = CreateToggle(sp, -300,
+        "Skip Guild Members in Alerts",
+        "Don't show alerts for players in your guild.",
+        function() return db and db.settings and db.settings.alertSkipGuild or false end,
+        function(val)
+            if db and db.settings then db.settings.alertSkipGuild = val end
+            P("Skip guild in alerts: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
     -- Toggle: Minimap Button
-    local minimapToggle = CreateToggle(sp, -138,
+    local minimapToggle = CreateToggle(sp, -348,
         "Minimap Button",
         "Show the WTFAY icon on your minimap.",
         function() return not (db and db.minimapHidden) end,
@@ -1135,7 +1250,15 @@ do
     sp:SetScript("OnShow", function()
         debugToggle.Refresh()
         autoTrackToggle.Refresh()
+        knownAlertsToggle.Refresh()
+        alertPopupToggle.Refresh()
+        alertSoundToggle.Refresh()
+        skipGuildToggle.Refresh()
         minimapToggle.Refresh()
+        -- Refresh sound dropdown selection
+        local idx = db and db.settings and db.settings.alertSoundChoice or 1
+        UIDropDownMenu_SetSelectedValue(soundDropdown, idx)
+        UIDropDownMenu_SetText(soundDropdown, (ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]).name)
     end)
 
     -- Public interface
@@ -1221,8 +1344,94 @@ do
         end
     )
 
+    -- Known player alerts toggle
+    local optKnownAlerts = BlizCheckbox(optPanel, -160,
+        "Known Player Alerts",
+        "Show a chat notification when known players join your group.",
+        function() return db and db.settings and db.settings.knownAlerts or false end,
+        function(val)
+            if db and db.settings then db.settings.knownAlerts = val end
+            P("Known player alerts: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Alert popup toggle
+    local optAlertPopup = BlizCheckbox(optPanel, -210,
+        "Alert Popup Panel",
+        "Also show a popup panel with known players (not just chat).",
+        function() return db and db.settings and db.settings.alertPopup or false end,
+        function(val)
+            if db and db.settings then db.settings.alertPopup = val end
+            P("Alert popup: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Alert sound toggle
+    local optAlertSound = BlizCheckbox(optPanel, -260,
+        "Alert Sound",
+        "Play a sound when the known player alert appears.",
+        function() return db and db.settings and db.settings.alertSound or false end,
+        function(val)
+            if db and db.settings then db.settings.alertSound = val end
+            P("Alert sound: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Sound picker dropdown (Blizzard panel)
+    local optSoundLabel = optPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    optSoundLabel:SetPoint("TOPLEFT", optPanel, "TOPLEFT", 22, -296)
+    optSoundLabel:SetText("Sound:")
+
+    local optSoundDropdown = CreateFrame("Frame", "WTFAYSoundDropdownBliz", optPanel, "UIDropDownMenuTemplate")
+    optSoundDropdown:SetPoint("LEFT", optSoundLabel, "RIGHT", -8, -2)
+    UIDropDownMenu_SetWidth(optSoundDropdown, 130)
+
+    local function OptSoundDropdown_Init(self, level)
+        for i, s in ipairs(ALERT_SOUNDS) do
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = s.name
+            info.value = i
+            info.func = function()
+                if db and db.settings then db.settings.alertSoundChoice = i end
+                UIDropDownMenu_SetSelectedValue(optSoundDropdown, i)
+                UIDropDownMenu_SetText(optSoundDropdown, s.name)
+                PlaySound(s.normal)
+            end
+            info.checked = (db and db.settings and db.settings.alertSoundChoice == i)
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end
+    UIDropDownMenu_Initialize(optSoundDropdown, OptSoundDropdown_Init)
+
+    local optPreviewBtn = CreateFrame("Button", nil, optPanel, "UIPanelButtonTemplate")
+    optPreviewBtn:SetSize(40, 22)
+    optPreviewBtn:SetPoint("LEFT", optSoundDropdown, "RIGHT", -4, 2)
+    optPreviewBtn:SetText("Test")
+    optPreviewBtn:SetScript("OnClick", function()
+        local idx = db and db.settings and db.settings.alertSoundChoice or 1
+        local choice = ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]
+        PlaySound(choice.normal)
+    end)
+    optPreviewBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Preview sound")
+        GameTooltip:Show()
+    end)
+    optPreviewBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    -- Skip guild toggle
+    local optSkipGuild = BlizCheckbox(optPanel, -340,
+        "Skip Guild Members in Alerts",
+        "Don't show alerts for players in your guild.",
+        function() return db and db.settings and db.settings.alertSkipGuild or false end,
+        function(val)
+            if db and db.settings then db.settings.alertSkipGuild = val end
+            P("Skip guild in alerts: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
     -- Minimap button toggle
-    local optMinimap = BlizCheckbox(optPanel, -160,
+    local optMinimap = BlizCheckbox(optPanel, -390,
         "Minimap Button",
         "Show the WTFAY icon on your minimap for quick access.",
         function() return not (db and db.minimapHidden) end,
@@ -1247,7 +1456,15 @@ do
     optPanel:SetScript("OnShow", function()
         optDebug.Refresh()
         optAutoTrack.Refresh()
+        optKnownAlerts.Refresh()
+        optAlertPopup.Refresh()
+        optAlertSound.Refresh()
+        optSkipGuild.Refresh()
         optMinimap.Refresh()
+        -- Refresh sound dropdown
+        local idx = db and db.settings and db.settings.alertSoundChoice or 1
+        UIDropDownMenu_SetSelectedValue(optSoundDropdown, idx)
+        UIDropDownMenu_SetText(optSoundDropdown, (ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]).name)
     end)
 
     -- Store reference; registration happens in PLAYER_LOGIN to ensure Blizzard UI is fully ready
@@ -2870,6 +3087,170 @@ end
 D("slash command registered OK")
 
 ----------------------------------------------------------------------
+-- Known Player Alert Popup
+----------------------------------------------------------------------
+local alertPopupFrame = CreateFrame("Frame", "WTFAYAlertPopup", UIParent)
+alertPopupFrame:SetSize(360, 60)  -- height grows dynamically
+alertPopupFrame:SetPoint("TOP", UIParent, "TOP", 0, -80)
+alertPopupFrame:SetFrameStrata("FULLSCREEN_DIALOG")
+alertPopupFrame:SetMovable(true)
+alertPopupFrame:EnableMouse(true)
+alertPopupFrame:RegisterForDrag("LeftButton")
+alertPopupFrame:SetClampedToScreen(true)
+alertPopupFrame:SetScript("OnDragStart", function(s) s:StartMoving() end)
+alertPopupFrame:SetScript("OnDragStop", function(s) s:StopMovingOrSizing() end)
+alertPopupFrame:Hide()
+
+if BackdropTemplateMixin then
+    Mixin(alertPopupFrame, BackdropTemplateMixin)
+    alertPopupFrame:OnBackdropLoaded()
+end
+if alertPopupFrame.SetBackdrop then
+    alertPopupFrame:SetBackdrop({
+        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true, tileSize = 32, edgeSize = 24,
+        insets = { left = 6, right = 6, top = 6, bottom = 6 },
+    })
+    alertPopupFrame:SetBackdropColor(0.08, 0.02, 0.02, 0.95)
+end
+
+-- Close on Escape
+do
+    local nm = alertPopupFrame:GetName()
+    if nm then tinsert(UISpecialFrames, nm) end
+end
+
+-- Close button
+local alertClose = CreateFrame("Button", nil, alertPopupFrame, "UIPanelCloseButton")
+alertClose:SetPoint("TOPRIGHT", alertPopupFrame, "TOPRIGHT", -2, -2)
+
+-- Title
+local alertTitle = alertPopupFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+alertTitle:SetPoint("TOP", alertPopupFrame, "TOP", 0, -14)
+
+-- Content: dynamically created player lines
+local alertLines = {}
+
+-- Dismiss button
+local alertDismiss = CreateFrame("Button", nil, alertPopupFrame, "UIPanelButtonTemplate")
+alertDismiss:SetSize(80, 22)
+alertDismiss:SetText("Dismiss")
+alertDismiss:SetScript("OnClick", function() alertPopupFrame:Hide() end)
+
+-- Auto-dismiss timer (optional: fade out after 15 seconds)
+local alertTimer = nil
+
+local function ShowAlertPopup(knownPlayers)
+    if not knownPlayers or #knownPlayers == 0 then return end
+
+    -- Cancel previous timer
+    if alertTimer then alertTimer = nil end
+
+    -- Count blacklisted
+    local blacklistCount = 0
+    for _, kp in ipairs(knownPlayers) do
+        if kp.player.rating and kp.player.rating <= -3 then
+            blacklistCount = blacklistCount + 1
+        end
+    end
+
+    -- Title
+    if blacklistCount > 0 then
+        alertTitle:SetText("|cFFFF4444!! Known Players Alert !!|r")
+        if alertPopupFrame.SetBackdropColor then
+            alertPopupFrame:SetBackdropColor(0.12, 0.02, 0.02, 0.96)
+        end
+    else
+        alertTitle:SetText("|cFF" .. ACCENT .. "Known Players in Group|r")
+        if alertPopupFrame.SetBackdropColor then
+            alertPopupFrame:SetBackdropColor(0.05, 0.05, 0.08, 0.96)
+        end
+    end
+
+    -- Clear old lines
+    for _, line in ipairs(alertLines) do line:Hide() end
+
+    -- Build player lines
+    local yOffset = -38
+    local lineHeight = 32
+    for i, kp in ipairs(knownPlayers) do
+        local p = kp.player
+        local line = alertLines[i]
+        if not line then
+            line = CreateFrame("Frame", nil, alertPopupFrame)
+            line:SetHeight(lineHeight)
+            line:SetPoint("LEFT", alertPopupFrame, "LEFT", 14, 0)
+            line:SetPoint("RIGHT", alertPopupFrame, "RIGHT", -14, 0)
+
+            line.nameText = line:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            line.nameText:SetPoint("TOPLEFT", line, "TOPLEFT", 0, 0)
+            line.nameText:SetJustifyH("LEFT")
+
+            line.noteText = line:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            line.noteText:SetPoint("TOPLEFT", line.nameText, "BOTTOMLEFT", 2, -1)
+            line.noteText:SetPoint("RIGHT", line, "RIGHT", 0, 0)
+            line.noteText:SetJustifyH("LEFT")
+            line.noteText:SetWordWrap(false)
+
+            alertLines[i] = line
+        end
+
+        line:ClearAllPoints()
+        line:SetPoint("TOPLEFT", alertPopupFrame, "TOPLEFT", 14, yOffset)
+        line:SetPoint("RIGHT", alertPopupFrame, "RIGHT", -14, 0)
+
+        local cc = ClassColor(p.class)
+        local ratingStr = ColorRating(p.rating or 0)
+        local prefix = ""
+        if p.rating and p.rating <= -3 then
+            prefix = "|cFFFF0000[BLACKLISTED]|r  "
+        end
+        line.nameText:SetText(prefix .. cc .. p.name .. "|r  " .. cc .. (p.class or "") .. "|r  Lv " .. (p.level or "?") .. "  Rating: " .. ratingStr)
+
+        if p.note and p.note ~= "" then
+            line.noteText:SetText("|cFFBBBBBB\"" .. p.note .. "\"|r")
+        else
+            line.noteText:SetText("")
+        end
+
+        line:Show()
+        yOffset = yOffset - lineHeight
+    end
+
+    -- Hide excess lines
+    for i = #knownPlayers + 1, #alertLines do
+        alertLines[i]:Hide()
+    end
+
+    -- Resize frame to fit content
+    local totalHeight = 38 + (#knownPlayers * lineHeight) + 36
+    alertPopupFrame:SetSize(360, totalHeight)
+
+    -- Position dismiss button at bottom
+    alertDismiss:ClearAllPoints()
+    alertDismiss:SetPoint("BOTTOM", alertPopupFrame, "BOTTOM", 0, 10)
+
+    alertPopupFrame:Show()
+
+    -- Play alert sound if enabled
+    PlayAlertSound(blacklistCount > 0)
+
+    -- Auto-dismiss after 20 seconds (unless blacklisted players, then stay)
+    if blacklistCount == 0 then
+        local dismissTime = time() + 20
+        alertTimer = dismissTime
+        C_Timer.After(20, function()
+            if alertTimer == dismissTime and alertPopupFrame:IsShown() then
+                alertPopupFrame:Hide()
+            end
+        end)
+    end
+end
+
+D("alert popup OK")
+
+----------------------------------------------------------------------
 -- Auto-tracking: automatically log party/raid members
 ----------------------------------------------------------------------
 local autoTracker = CreateFrame("Frame")
@@ -2891,87 +3272,145 @@ local function GetGroupSourceAndZone()
     end
 end
 
+-- Helper: build a set of guild member names for fast lookup
+local function GetGuildMemberSet()
+    local guildSet = {}
+    if not IsInGuild() then return guildSet end
+    local numGuild = GetNumGuildMembers and GetNumGuildMembers() or 0
+    for i = 1, numGuild do
+        local fullName = GetGuildRosterInfo(i)
+        if fullName then
+            -- fullName may be "Name" or "Name-Realm"
+            local shortName = fullName:match("^([^%-]+)") or fullName
+            guildSet[shortName] = true
+            guildSet[fullName] = true
+        end
+    end
+    return guildSet
+end
+
+-- Cooldown: track last alert set to avoid spamming the same alerts
+local lastAlertKeys = {}
+local lastAlertTime = 0
+
 -- Scan all current group/raid members and add/update them
 local function ScanGroupMembers()
     if not db or not db.settings or not db.settings.autoTrack then return end
-    if not IsInGroup() and not IsInRaid() then return end
+    if not IsInGroup() and not IsInRaid() then
+        -- Left group: reset alert fingerprint so next join triggers fresh
+        lastAlertKeys = ""
+        lastAlertTime = 0
+        return
+    end
 
     local source, zone = GetGroupSourceAndZone()
     local myName = UnitName("player") or ""
     local numMembers
+    local knownPlayers = {}  -- collect known players for alerts
+    local guildSet = nil     -- lazy-loaded
 
-    if IsInRaid() then
-        numMembers = GetNumRaidMembers and GetNumRaidMembers() or GetNumGroupMembers() or 0
-        for i = 1, numMembers do
-            local unit = "raid" .. i
-            if UnitExists(unit) and UnitIsPlayer(unit) then
-                local name, realm = UnitName(unit)
-                if name and name ~= myName then
-                    realm = (realm and realm ~= "") and realm or (GetRealmName() or "Unknown")
-                    local _, classFile = UnitClass(unit)
-                    local className = classFile and (classFile:sub(1,1):upper() .. classFile:sub(2):lower()) or "Unknown"
-                    local raceName = UnitRace(unit) or ""
-                    local level = UnitLevel(unit) or 0
-                    local key = name .. "-" .. realm
+    -- Helper: process a single unit
+    local function ProcessUnit(unit)
+        if not UnitExists(unit) or not UnitIsPlayer(unit) then return end
+        local name, realm = UnitName(unit)
+        if not name or name == myName then return end
 
-                    if db.players[key] then
-                        local p = db.players[key]
-                        p.seen = Timestamp()
-                        if className ~= "Unknown" then p.class = className end
-                        if raceName ~= "" then p.race = raceName end
-                        if level > 0 and level > (p.level or 0) then p.level = level end
-                        p.source = source
-                        LogEncounter(key, source, zone)
-                    else
-                        db.players[key] = {
-                            name = name, realm = realm, class = className,
-                            race = raceName, level = level, rating = 0,
-                            note = "", source = source, seen = Timestamp(),
-                            encounters = {},
-                        }
-                        LogEncounter(key, source, zone)
-                    end
-                end
-            end
+        realm = (realm and realm ~= "") and realm or (GetRealmName() or "Unknown")
+        local _, classFile = UnitClass(unit)
+        local className = classFile and (classFile:sub(1,1):upper() .. classFile:sub(2):lower()) or "Unknown"
+        local raceName = UnitRace(unit) or ""
+        local level = UnitLevel(unit) or 0
+        local key = name .. "-" .. realm
+        local wasKnown = db.players[key] ~= nil
+
+        if wasKnown then
+            local p = db.players[key]
+            p.seen = Timestamp()
+            if className ~= "Unknown" then p.class = className end
+            if raceName ~= "" then p.race = raceName end
+            if level > 0 and level > (p.level or 0) then p.level = level end
+            p.source = source
+            LogEncounter(key, source, zone)
+        else
+            db.players[key] = {
+                name = name, realm = realm, class = className,
+                race = raceName, level = level, rating = 0,
+                note = "", source = source, seen = Timestamp(),
+                encounters = {},
+            }
+            LogEncounter(key, source, zone)
         end
-    else
-        -- Party (5-man)
-        numMembers = GetNumPartyMembers and GetNumPartyMembers() or (GetNumGroupMembers and GetNumGroupMembers() or 0)
-        for i = 1, numMembers do
-            local unit = "party" .. i
-            if UnitExists(unit) and UnitIsPlayer(unit) then
-                local name, realm = UnitName(unit)
-                if name and name ~= myName then
-                    realm = (realm and realm ~= "") and realm or (GetRealmName() or "Unknown")
-                    local _, classFile = UnitClass(unit)
-                    local className = classFile and (classFile:sub(1,1):upper() .. classFile:sub(2):lower()) or "Unknown"
-                    local raceName = UnitRace(unit) or ""
-                    local level = UnitLevel(unit) or 0
-                    local key = name .. "-" .. realm
 
-                    if db.players[key] then
-                        local p = db.players[key]
-                        p.seen = Timestamp()
-                        if className ~= "Unknown" then p.class = className end
-                        if raceName ~= "" then p.race = raceName end
-                        if level > 0 and level > (p.level or 0) then p.level = level end
-                        p.source = source
-                        LogEncounter(key, source, zone)
-                    else
-                        db.players[key] = {
-                            name = name, realm = realm, class = className,
-                            race = raceName, level = level, rating = 0,
-                            note = "", source = source, seen = Timestamp(),
-                            encounters = {},
-                        }
-                        LogEncounter(key, source, zone)
-                    end
-                end
+        -- Collect for alert if this player was already in the database
+        if wasKnown and db.settings.knownAlerts then
+            local p = db.players[key]
+            -- Skip guild members if setting is on
+            local skipThis = false
+            if db.settings.alertSkipGuild then
+                if not guildSet then guildSet = GetGuildMemberSet() end
+                if guildSet[name] or guildSet[key] then skipThis = true end
+            end
+            if not skipThis then
+                knownPlayers[#knownPlayers + 1] = { key = key, player = p }
             end
         end
     end
 
+    if IsInRaid() then
+        numMembers = GetNumRaidMembers and GetNumRaidMembers() or GetNumGroupMembers() or 0
+        for i = 1, numMembers do ProcessUnit("raid" .. i) end
+    else
+        numMembers = GetNumPartyMembers and GetNumPartyMembers() or (GetNumGroupMembers and GetNumGroupMembers() or 0)
+        for i = 1, numMembers do ProcessUnit("party" .. i) end
+    end
+
     D("ScanGroupMembers: source=" .. source .. " zone=" .. tostring(zone) .. " members=" .. tostring(numMembers))
+
+    -- Known player alerts (only when new known players appear in the group)
+    if #knownPlayers > 0 then
+        local now = time()
+        -- Build a fingerprint of the alert set
+        local fingerprint = {}
+        for _, kp in ipairs(knownPlayers) do fingerprint[#fingerprint + 1] = kp.key end
+        table.sort(fingerprint)
+        local fpStr = table.concat(fingerprint, ",")
+
+        -- Only alert if the set of known players has CHANGED (new people joined)
+        -- Same set = skip (avoids false alerts from level-ups, zone changes, etc.)
+        if fpStr ~= lastAlertKeys then
+            lastAlertKeys = fpStr
+            lastAlertTime = now
+
+            -- Always show in chat
+            P("|cFFFFFFFFKnown players in your group:|r")
+            for _, kp in ipairs(knownPlayers) do
+                local p = kp.player
+                local cc = ClassColor(p.class)
+                local ratingStr = ColorRating(p.rating or 0)
+                local noteStr = (p.note and p.note ~= "") and ("  |cFFBBBBBB\"" .. p.note .. "\"|r") or ""
+
+                -- Special warning line for blacklisted players
+                if p.rating and p.rating <= -3 then
+                    P("  |cFFFF0000>>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+                else
+                    P("  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+                end
+            end
+
+            -- Additionally show popup if enabled
+            if db.settings.alertPopup then
+                ShowAlertPopup(knownPlayers)
+            else
+                -- Sound without popup: play sound based on whether any blacklisted
+                local hasBlacklist = false
+                for _, kp in ipairs(knownPlayers) do
+                    if kp.player.rating and kp.player.rating <= -3 then hasBlacklist = true; break end
+                end
+                PlayAlertSound(hasBlacklist)
+            end
+        end
+    end
+
     RefreshList()
 end
 
