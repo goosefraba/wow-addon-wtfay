@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.1
+
+### Bug Fixes
+- Fixed known-player alert firing when members leave the party or raid (now only triggers when someone joins)
+- Fixed export panel showing blank text — the pipe separator conflicted with WoW's escape characters (switched to tab-separated V2 format)
+
 ## v0.4.0
 
 ### New Features
