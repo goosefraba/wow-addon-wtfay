@@ -3290,7 +3290,8 @@ local function GetGuildMemberSet()
 end
 
 -- Cooldown: track last alert set to avoid spamming the same alerts
-local lastAlertKeys = {}
+local lastAlertKeys = ""
+local lastAlertSet = {}   -- set of player keys for detecting genuinely new arrivals
 local lastAlertTime = 0
 
 -- Scan all current group/raid members and add/update them
@@ -3299,6 +3300,7 @@ local function ScanGroupMembers()
     if not IsInGroup() and not IsInRaid() then
         -- Left group: reset alert fingerprint so next join triggers fresh
         lastAlertKeys = ""
+        lastAlertSet = {}
         lastAlertTime = 0
         return
     end
@@ -3375,38 +3377,53 @@ local function ScanGroupMembers()
         table.sort(fingerprint)
         local fpStr = table.concat(fingerprint, ",")
 
-        -- Only alert if the set of known players has CHANGED (new people joined)
+        -- Only alert if genuinely NEW known players appeared (not just removals)
         -- Same set = skip (avoids false alerts from level-ups, zone changes, etc.)
         if fpStr ~= lastAlertKeys then
-            lastAlertKeys = fpStr
-            lastAlertTime = now
-
-            -- Always show in chat
-            P("|cFFFFFFFFKnown players in your group:|r")
+            -- Check whether any current player is new (was not in previous set)
+            local hasNew = false
             for _, kp in ipairs(knownPlayers) do
-                local p = kp.player
-                local cc = ClassColor(p.class)
-                local ratingStr = ColorRating(p.rating or 0)
-                local noteStr = (p.note and p.note ~= "") and ("  |cFFBBBBBB\"" .. p.note .. "\"|r") or ""
-
-                -- Special warning line for blacklisted players
-                if p.rating and p.rating <= -3 then
-                    P("  |cFFFF0000>>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
-                else
-                    P("  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+                if not lastAlertSet[kp.key] then
+                    hasNew = true
+                    break
                 end
             end
 
-            -- Additionally show popup if enabled
-            if db.settings.alertPopup then
-                ShowAlertPopup(knownPlayers)
-            else
-                -- Sound without popup: play sound based on whether any blacklisted
-                local hasBlacklist = false
+            -- Always update the tracked state
+            lastAlertKeys = fpStr
+            lastAlertTime = now
+            lastAlertSet = {}
+            for _, kp in ipairs(knownPlayers) do lastAlertSet[kp.key] = true end
+
+            -- Only notify when someone new joined, not when someone left
+            if hasNew then
+                -- Always show in chat
+                P("|cFFFFFFFFKnown players in your group:|r")
                 for _, kp in ipairs(knownPlayers) do
-                    if kp.player.rating and kp.player.rating <= -3 then hasBlacklist = true; break end
+                    local p = kp.player
+                    local cc = ClassColor(p.class)
+                    local ratingStr = ColorRating(p.rating or 0)
+                    local noteStr = (p.note and p.note ~= "") and ("  |cFFBBBBBB\"" .. p.note .. "\"|r") or ""
+
+                    -- Special warning line for blacklisted players
+                    if p.rating and p.rating <= -3 then
+                        P("  |cFFFF0000>>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+                    else
+                        P("  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+                    end
                 end
-                PlayAlertSound(hasBlacklist)
+
+                -- Additionally show popup if enabled
+                if db.settings.alertPopup then
+                    ShowAlertPopup(knownPlayers)
+                else
+                    -- Sound without popup: play sound based on whether any blacklisted
+                    local hasBlacklist = false
+                    for _, kp in ipairs(knownPlayers) do
+                        if kp.player.rating and kp.player.rating <= -3 then hasBlacklist = true; break end
+                    end
+                    PlayAlertSound(hasBlacklist)
+                end
             end
         end
     end
