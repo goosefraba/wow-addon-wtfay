@@ -31,7 +31,7 @@ jobs:
       - name: Build zip
         run: |
           mkdir -p WTFAY
-          cp WTFAY.lua WTFAY.toc CHANGELOG.md LICENSE README.md WTFAY/
+          cp WTFAY.lua WTFAY.toc WTFAY/
           zip -r WTFAY-${{ github.ref_name }}.zip WTFAY/
 
       - name: GitHub Release
