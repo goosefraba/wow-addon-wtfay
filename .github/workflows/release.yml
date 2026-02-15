@@ -4,6 +4,9 @@ on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: write
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -42,6 +45,7 @@ jobs:
           files: WTFAY-${{ github.ref_name }}.zip
 
       - name: Upload to CurseForge
+        if: secrets.CF_API_TOKEN != ''
         uses: itsmeow/curseforge-upload@v3
         with:
           token: ${{ secrets.CF_API_TOKEN }}
