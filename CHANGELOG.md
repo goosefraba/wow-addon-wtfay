@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.2
+
+### New Features
+- **Multi-Source Tracking** — Players now show all sources they've been seen in (e.g. "Group, Dungeon") instead of only the most recent one
+- **Source filter** matches any source a player has ever been seen in
+- **Stats panel** counts players in all their source categories
+- **Edit Note: Enter to Save** — Press Enter to save notes instead of clicking the button
+- **Edit Note: Escape to Cancel** — Press Escape to close the note editor
+
+### Bug Fixes
+- Fixed duplicate dungeon encounters from wipes/corpse runs — same instance now only logs one encounter per player
+- Fixed non-instanced encounters (group) logging duplicates within 30 minutes
+- Fixed alert popup firing when group members leave (now only triggers on genuine new arrivals)
+- Improved alert anti-spam: session-based tracking prevents re-alerting for temporarily unscannable players
+
 ## v0.4.1
 
 ### Bug Fixes

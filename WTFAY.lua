@@ -1,9 +1,9 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.4.1
+-- WTFAY - Who The F* Are You?   v0.4.2
 -- Database, slash commands, browse UI, rating, notes
 ----------------------------------------------------------------------
 local ADDON_NAME = "WTFAY"
-local ADDON_VERSION = "0.4.1"
+local ADDON_VERSION = "0.4.2"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
@@ -41,6 +41,39 @@ end
 
 local function Timestamp()
     return date("%Y-%m-%d %H:%M")
+end
+
+local SOURCE_INFO = {
+    raid    = { color = "FF6699", label = "Raid" },
+    dungeon = { color = "66BBFF", label = "Dungeon" },
+    group   = { color = "99FF66", label = "Group" },
+    manual  = { color = "FFCC44", label = "Manual" },
+}
+local SOURCE_ORDER = { "raid", "dungeon", "group", "manual" }
+
+-- Derive all unique sources from a player's encounter history
+-- Returns: sourceSet (table of booleans), displayStr (colored comma-separated)
+local function GetPlayerSources(p)
+    local set = {}
+    if p.encounters and #p.encounters > 0 then
+        for _, e in ipairs(p.encounters) do
+            local src = e.source or "manual"
+            set[src] = true
+        end
+    end
+    -- Fallback: if no encounters, use the stored source
+    if not next(set) then
+        set[p.source or "manual"] = true
+    end
+    -- Build colored display string in consistent order
+    local parts = {}
+    for _, src in ipairs(SOURCE_ORDER) do
+        if set[src] then
+            local info = SOURCE_INFO[src]
+            parts[#parts + 1] = "|cFF" .. info.color .. info.label .. "|r"
+        end
+    end
+    return set, table.concat(parts, ", ")
 end
 
 D("helpers OK")
@@ -173,24 +206,36 @@ local function LogEncounter(key, source, zone)
     end
     local enc = db.players[key].encounters
 
-    -- Avoid duplicate encounters within 60 seconds (prevents spam from rapid event fires)
+    -- Dedup logic:
+    -- Instanced content (dungeon/raid with a zone): skip if same source + same zone
+    --   → wipes, corpse runs, reloads won't create duplicates
+    --   → running a different dungeon creates a new encounter
+    -- Non-instanced (group/manual, no zone): skip if same source within 30 minutes
+    --   → regrouping after a break creates a new encounter
     local now = time()
+    local effectiveSource = source or db.players[key].source or "manual"
+    local effectiveZone = (zone and zone ~= "") and zone or nil
     if #enc > 0 then
         local last = enc[#enc]
-        -- Parse last timestamp to compare
-        if last._ts and (now - last._ts) < 60 and last.source == (source or db.players[key].source or "manual") then
-            return
+        if last.source == effectiveSource then
+            if effectiveZone and effectiveZone == (last.zone or nil) then
+                -- Same instance — skip (covers wipes, corpse runs)
+                return
+            elseif not effectiveZone and not last.zone and last._ts and (now - last._ts) < 1800 then
+                -- Same non-instanced source within 30 min — skip
+                return
+            end
         end
     end
 
     -- Append newest at the end (we'll display newest-first)
     local entry = {
         time   = Timestamp(),
-        source = source or db.players[key].source or "manual",
-        _ts    = now,  -- raw timestamp for dedup (not displayed)
+        source = effectiveSource,
+        _ts    = now,
     }
-    if zone and zone ~= "" then
-        entry.zone = zone
+    if effectiveZone then
+        entry.zone = effectiveZone
     end
     enc[#enc + 1] = entry
 end
@@ -221,9 +266,10 @@ local function RebuildSorted(filterText, ratingMin, ratingMax, sourceFilter, cla
         local r = p.rating or 0
         if ratingMin and r < ratingMin then match = false end
         if ratingMax and r > ratingMax then match = false end
-        -- Source filter
-        if sourceFilter and (p.source or "manual") ~= sourceFilter then
-            match = false
+        -- Source filter (checks all encounter sources, not just most recent)
+        if sourceFilter then
+            local srcSet = GetPlayerSources(p)
+            if not srcSet[sourceFilter] then match = false end
         end
         -- Class filter
         if classLower and (p.class or ""):lower() ~= classLower then
@@ -917,13 +963,8 @@ RefreshList = function()
                 row.noteText:SetText("|cFF666666(no note)|r")
             end
 
-            local srcInfo = ({
-                raid    = { color = "FF6699", label = "Raid" },
-                dungeon = { color = "66BBFF", label = "Dungeon" },
-                group   = { color = "99FF66", label = "Group" },
-                manual  = { color = "FFCC44", label = "Added manually" },
-            })[p.source or "manual"] or { color = "CCCCCC", label = p.source or "?" }
-            row.sourceText:SetText("|cFF" .. srcInfo.color .. srcInfo.label .. "|r |cFF666666" .. (p.seen or "") .. "|r")
+            local _, srcDisplay = GetPlayerSources(p)
+            row.sourceText:SetText(srcDisplay .. " |cFF666666" .. (p.seen or "") .. "|r")
 
             row.playerKey = key
 
@@ -2068,12 +2109,11 @@ do
             else countPositive = countPositive + 1
             end
 
-            local src = p.source or "manual"
-            if src == "raid" then countRaid = countRaid + 1
-            elseif src == "dungeon" then countDungeon = countDungeon + 1
-            elseif src == "group" then countGroup = countGroup + 1
-            else countManual = countManual + 1
-            end
+            local srcSet = GetPlayerSources(p)
+            if srcSet["raid"] then countRaid = countRaid + 1 end
+            if srcSet["dungeon"] then countDungeon = countDungeon + 1 end
+            if srcSet["group"] then countGroup = countGroup + 1 end
+            if srcSet["manual"] then countManual = countManual + 1 end
 
             local cls = (p.class or "Unknown"):upper()
             classCounts[cls] = (classCounts[cls] or 0) + 1
@@ -2367,6 +2407,13 @@ StaticPopupDialogs["WTFAY_EDIT_NOTE"] = {
                 end
                 eb:SetFocus()
                 eb:HighlightText()
+                local saveBtn = self.button1 or _G[self:GetName() .. "Button1"]
+                eb:SetScript("OnEnterPressed", function()
+                    if saveBtn then saveBtn:Click() end
+                end)
+                eb:SetScript("OnEscapePressed", function()
+                    self:Hide()
+                end)
             end
         end)
         if not ok then D("EDIT_NOTE OnShow ERROR: " .. tostring(err)) end
@@ -2374,6 +2421,7 @@ StaticPopupDialogs["WTFAY_EDIT_NOTE"] = {
     timeout = 0,
     whileDead = true,
     hideOnEscape = true,
+    enterClicksFirstButton = true,
     exclusive = true,
 }
 
@@ -3382,60 +3430,45 @@ local function ScanGroupMembers()
 
     -- Known player alerts (only when new known players appear in the group)
     if #knownPlayers > 0 then
-        local now = time()
-        -- Build a fingerprint of the alert set
-        local fingerprint = {}
-        for _, kp in ipairs(knownPlayers) do fingerprint[#fingerprint + 1] = kp.key end
-        table.sort(fingerprint)
-        local fpStr = table.concat(fingerprint, ",")
+        -- Check whether any current player is genuinely new (not seen before this session)
+        local newPlayers = {}
+        for _, kp in ipairs(knownPlayers) do
+            if not lastAlertSet[kp.key] then
+                newPlayers[#newPlayers + 1] = kp
+            end
+        end
 
-        -- Only alert if genuinely NEW known players appeared (not just removals)
-        -- Same set = skip (avoids false alerts from level-ups, zone changes, etc.)
-        if fpStr ~= lastAlertKeys then
-            -- Check whether any current player is new (was not in previous set)
-            local hasNew = false
+        -- Add all current players to the session set (only grows, never shrinks)
+        for _, kp in ipairs(knownPlayers) do lastAlertSet[kp.key] = true end
+
+        -- Only alert if there are genuinely new players (skip on leaves, level-ups, etc.)
+        if #newPlayers > 0 then
+            -- Always show in chat
+            P("|cFFFFFFFFKnown players in your group:|r")
             for _, kp in ipairs(knownPlayers) do
-                if not lastAlertSet[kp.key] then
-                    hasNew = true
-                    break
+                local p = kp.player
+                local cc = ClassColor(p.class)
+                local ratingStr = ColorRating(p.rating or 0)
+                local noteStr = (p.note and p.note ~= "") and ("  |cFFBBBBBB\"" .. p.note .. "\"|r") or ""
+
+                -- Special warning line for blacklisted players
+                if p.rating and p.rating <= -3 then
+                    P("  |cFFFF0000>>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+                else
+                    P("  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
                 end
             end
 
-            -- Always update the tracked state
-            lastAlertKeys = fpStr
-            lastAlertTime = now
-            lastAlertSet = {}
-            for _, kp in ipairs(knownPlayers) do lastAlertSet[kp.key] = true end
-
-            -- Only notify when someone new joined, not when someone left
-            if hasNew then
-                -- Always show in chat
-                P("|cFFFFFFFFKnown players in your group:|r")
+            -- Additionally show popup if enabled
+            if db.settings.alertPopup then
+                ShowAlertPopup(knownPlayers)
+            else
+                -- Sound without popup: play sound based on whether any blacklisted
+                local hasBlacklist = false
                 for _, kp in ipairs(knownPlayers) do
-                    local p = kp.player
-                    local cc = ClassColor(p.class)
-                    local ratingStr = ColorRating(p.rating or 0)
-                    local noteStr = (p.note and p.note ~= "") and ("  |cFFBBBBBB\"" .. p.note .. "\"|r") or ""
-
-                    -- Special warning line for blacklisted players
-                    if p.rating and p.rating <= -3 then
-                        P("  |cFFFF0000>>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
-                    else
-                        P("  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
-                    end
+                    if kp.player.rating and kp.player.rating <= -3 then hasBlacklist = true; break end
                 end
-
-                -- Additionally show popup if enabled
-                if db.settings.alertPopup then
-                    ShowAlertPopup(knownPlayers)
-                else
-                    -- Sound without popup: play sound based on whether any blacklisted
-                    local hasBlacklist = false
-                    for _, kp in ipairs(knownPlayers) do
-                        if kp.player.rating and kp.player.rating <= -3 then hasBlacklist = true; break end
-                    end
-                    PlayAlertSound(hasBlacklist)
-                end
+                PlayAlertSound(hasBlacklist)
             end
         end
     end
