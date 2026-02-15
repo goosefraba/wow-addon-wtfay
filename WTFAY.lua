@@ -1663,21 +1663,28 @@ D("bottom bar OK")
 importExportPanel = {}
 
 do
-    -- Serialize one player to a line: key|name|realm|class|race|level|rating|note|source|seen
-    local SEP = "|"
-    local FIELD_ESC = "@@PIPE@@"  -- escape literal pipes in notes
+    -- Serialize one player to a line: key\tname\trealm\tclass\trace\tlevel\trating\tnote\tsource\tseen
+    -- NOTE: pipe "|" was used as separator in V1 but WoW interprets | as an
+    -- escape character (|H = hyperlink, |T = texture, |c = colour, etc.),
+    -- which caused the EditBox to render export text as invisible/blank.
+    -- V2 uses tab as separator instead.
+    local SEP = "\t"
+    local FIELD_ESC_PIPE = "@@PIPE@@"  -- escape literal pipes in notes
+    local FIELD_ESC_TAB  = "@@TAB@@"   -- escape literal tabs (shouldn't appear, but be safe)
 
     local function EscField(s)
-        return (s or ""):gsub("|", FIELD_ESC)
+        s = (s or ""):gsub("|", FIELD_ESC_PIPE)
+        return s:gsub("\t", FIELD_ESC_TAB)
     end
     local function UnescField(s)
-        return (s or ""):gsub(FIELD_ESC, "|")
+        s = (s or ""):gsub(FIELD_ESC_TAB, "\t")
+        return s:gsub(FIELD_ESC_PIPE, "|")
     end
 
     local function ExportDB()
         if not db or not db.players then return "" end
         local lines = {}
-        lines[1] = "WTFAY_EXPORT_V1"  -- header for version detection
+        lines[1] = "WTFAY_EXPORT_V2"  -- header for version detection
         for key, p in pairs(db.players) do
             local parts = {
                 EscField(key),
@@ -1701,16 +1708,21 @@ do
         local lines = { strsplit("\n", text) }
         local added, updated = 0, 0
 
-        -- Check header
+        -- Check header and detect format version
         local startLine = 1
-        if lines[1] and lines[1]:find("^WTFAY_EXPORT_V1") then
+        local lineSep = SEP  -- default to current (tab)
+        if lines[1] and lines[1]:find("^WTFAY_EXPORT_V2") then
             startLine = 2
+            lineSep = "\t"
+        elseif lines[1] and lines[1]:find("^WTFAY_EXPORT_V1") then
+            startLine = 2
+            lineSep = "|"
         end
 
         for i = startLine, #lines do
             local line = (lines[i] or ""):trim()
             if line ~= "" then
-                local parts = { strsplit(SEP, line) }
+                local parts = { strsplit(lineSep, line) }
                 -- Need at least: key, name, realm, class, race, level, rating, note, source, seen
                 if #parts >= 10 then
                     local key     = UnescField(parts[1])
