@@ -85,6 +85,9 @@ local SETTINGS_DEFAULTS = {
     alertSound       = true,   -- Play a sound when the alert popup appears
     alertSoundChoice = 1,      -- Index into ALERT_SOUNDS (default: Quest Complete)
     alertSkipGuild   = true,   -- Skip guild members from known player alerts
+    alertOnJoin      = true,   -- Alert when a known player joins your group
+    alertOnLeave     = false,  -- Alert when a known player leaves your group
+    alertOnSelfJoin  = true,   -- Alert when you join a group with known players
 }
 
 -- Play the user's chosen alert sound (isBlacklist = true for blacklisted warning)
@@ -1037,7 +1040,7 @@ local settingsPanel = {}
 
 do
     local sp = CreateFrame("Frame", "WTFAYSettingsPanel", UIParent)
-    sp:SetSize(280, 470)
+    sp:SetSize(280, 580)
     sp:SetPoint("CENTER", UIParent, "CENTER", 0, 60)
     sp:SetFrameStrata("FULLSCREEN_DIALOG")
     sp:SetMovable(true)
@@ -1146,8 +1149,41 @@ do
         end
     )
 
+    -- Toggle: Alert when players join
+    local alertOnJoinToggle = CreateToggle(sp, -176,
+        "Alert When Players Join",
+        "Show alerts when a known player joins your existing group or raid.",
+        function() return db and db.settings and db.settings.alertOnJoin or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnJoin = val end
+            P("Alert on join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Toggle: Alert when players leave
+    local alertOnLeaveToggle = CreateToggle(sp, -214,
+        "Alert When Players Leave",
+        "Show alerts when a known player leaves your group or raid.",
+        function() return db and db.settings and db.settings.alertOnLeave or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnLeave = val end
+            P("Alert on leave: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Toggle: Alert when I join a group
+    local alertOnSelfJoinToggle = CreateToggle(sp, -252,
+        "Alert When I Join a Group",
+        "Show alerts for known players already in a group or raid you join.",
+        function() return db and db.settings and db.settings.alertOnSelfJoin or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnSelfJoin = val end
+            P("Alert on self join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
     -- Toggle: Alert Popup Panel
-    local alertPopupToggle = CreateToggle(sp, -186,
+    local alertPopupToggle = CreateToggle(sp, -298,
         "Alert Popup Panel",
         "Also show a popup panel with known players (not just chat).",
         function() return db and db.settings and db.settings.alertPopup or false end,
@@ -1158,7 +1194,7 @@ do
     )
 
     -- Toggle: Alert Sound
-    local alertSoundToggle = CreateToggle(sp, -234,
+    local alertSoundToggle = CreateToggle(sp, -346,
         "Alert Sound",
         "Play a sound when the known player alert appears.",
         function() return db and db.settings and db.settings.alertSound or false end,
@@ -1170,7 +1206,7 @@ do
 
     -- Sound picker label + dropdown + preview button
     local soundLabel = sp:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    soundLabel:SetPoint("TOPLEFT", sp, "TOPLEFT", 22, -268)
+    soundLabel:SetPoint("TOPLEFT", sp, "TOPLEFT", 22, -380)
     soundLabel:SetText("|cFFBBBBBBSound:|r")
 
     local soundDropdown = CreateFrame("Frame", "WTFAYSoundDropdownStandalone", sp, "UIDropDownMenuTemplate")
@@ -1212,7 +1248,7 @@ do
     previewBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     -- Toggle: Skip Guild Members in Alerts
-    local skipGuildToggle = CreateToggle(sp, -300,
+    local skipGuildToggle = CreateToggle(sp, -412,
         "Skip Guild Members in Alerts",
         "Don't show alerts for players in your guild.",
         function() return db and db.settings and db.settings.alertSkipGuild or false end,
@@ -1223,7 +1259,7 @@ do
     )
 
     -- Toggle: Minimap Button
-    local minimapToggle = CreateToggle(sp, -348,
+    local minimapToggle = CreateToggle(sp, -460,
         "Minimap Button",
         "Show the WTFAY icon on your minimap.",
         function() return not (db and db.minimapHidden) end,
@@ -1251,6 +1287,9 @@ do
         debugToggle.Refresh()
         autoTrackToggle.Refresh()
         knownAlertsToggle.Refresh()
+        alertOnJoinToggle.Refresh()
+        alertOnLeaveToggle.Refresh()
+        alertOnSelfJoinToggle.Refresh()
         alertPopupToggle.Refresh()
         alertSoundToggle.Refresh()
         skipGuildToggle.Refresh()
@@ -1355,8 +1394,41 @@ do
         end
     )
 
+    -- Alert on join toggle
+    local optAlertOnJoin = BlizCheckbox(optPanel, -198,
+        "Alert When Players Join",
+        "Show alerts when a known player joins your existing group or raid.",
+        function() return db and db.settings and db.settings.alertOnJoin or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnJoin = val end
+            P("Alert on join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Alert on leave toggle
+    local optAlertOnLeave = BlizCheckbox(optPanel, -236,
+        "Alert When Players Leave",
+        "Show alerts when a known player leaves your group or raid.",
+        function() return db and db.settings and db.settings.alertOnLeave or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnLeave = val end
+            P("Alert on leave: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Alert on self join toggle
+    local optAlertOnSelfJoin = BlizCheckbox(optPanel, -274,
+        "Alert When I Join a Group",
+        "Show alerts for known players already in a group or raid you join.",
+        function() return db and db.settings and db.settings.alertOnSelfJoin or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnSelfJoin = val end
+            P("Alert on self join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
     -- Alert popup toggle
-    local optAlertPopup = BlizCheckbox(optPanel, -210,
+    local optAlertPopup = BlizCheckbox(optPanel, -320,
         "Alert Popup Panel",
         "Also show a popup panel with known players (not just chat).",
         function() return db and db.settings and db.settings.alertPopup or false end,
@@ -1367,7 +1439,7 @@ do
     )
 
     -- Alert sound toggle
-    local optAlertSound = BlizCheckbox(optPanel, -260,
+    local optAlertSound = BlizCheckbox(optPanel, -370,
         "Alert Sound",
         "Play a sound when the known player alert appears.",
         function() return db and db.settings and db.settings.alertSound or false end,
@@ -1379,7 +1451,7 @@ do
 
     -- Sound picker dropdown (Blizzard panel)
     local optSoundLabel = optPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    optSoundLabel:SetPoint("TOPLEFT", optPanel, "TOPLEFT", 22, -296)
+    optSoundLabel:SetPoint("TOPLEFT", optPanel, "TOPLEFT", 22, -406)
     optSoundLabel:SetText("Sound:")
 
     local optSoundDropdown = CreateFrame("Frame", "WTFAYSoundDropdownBliz", optPanel, "UIDropDownMenuTemplate")
@@ -1420,7 +1492,7 @@ do
     optPreviewBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     -- Skip guild toggle
-    local optSkipGuild = BlizCheckbox(optPanel, -340,
+    local optSkipGuild = BlizCheckbox(optPanel, -450,
         "Skip Guild Members in Alerts",
         "Don't show alerts for players in your guild.",
         function() return db and db.settings and db.settings.alertSkipGuild or false end,
@@ -1431,7 +1503,7 @@ do
     )
 
     -- Minimap button toggle
-    local optMinimap = BlizCheckbox(optPanel, -390,
+    local optMinimap = BlizCheckbox(optPanel, -500,
         "Minimap Button",
         "Show the WTFAY icon on your minimap for quick access.",
         function() return not (db and db.minimapHidden) end,
@@ -1457,6 +1529,9 @@ do
         optDebug.Refresh()
         optAutoTrack.Refresh()
         optKnownAlerts.Refresh()
+        optAlertOnJoin.Refresh()
+        optAlertOnLeave.Refresh()
+        optAlertOnSelfJoin.Refresh()
         optAlertPopup.Refresh()
         optAlertSound.Refresh()
         optSkipGuild.Refresh()
@@ -3153,8 +3228,9 @@ alertDismiss:SetScript("OnClick", function() alertPopupFrame:Hide() end)
 -- Auto-dismiss timer (optional: fade out after 15 seconds)
 local alertTimer = nil
 
-local function ShowAlertPopup(knownPlayers)
+local function ShowAlertPopup(knownPlayers, alertMode)
     if not knownPlayers or #knownPlayers == 0 then return end
+    alertMode = alertMode or "join"
 
     -- Cancel previous timer
     if alertTimer then alertTimer = nil end
@@ -3167,8 +3243,13 @@ local function ShowAlertPopup(knownPlayers)
         end
     end
 
-    -- Title
-    if blacklistCount > 0 then
+    -- Title based on mode
+    if alertMode == "leave" then
+        alertTitle:SetText("|cFFFF8800Known Players Left Group|r")
+        if alertPopupFrame.SetBackdropColor then
+            alertPopupFrame:SetBackdropColor(0.08, 0.06, 0.02, 0.96)
+        end
+    elseif blacklistCount > 0 then
         alertTitle:SetText("|cFFFF4444!! Known Players Alert !!|r")
         if alertPopupFrame.SetBackdropColor then
             alertPopupFrame:SetBackdropColor(0.12, 0.02, 0.02, 0.96)
@@ -3380,36 +3461,62 @@ local function ScanGroupMembers()
 
     D("ScanGroupMembers: source=" .. source .. " zone=" .. tostring(zone) .. " members=" .. tostring(numMembers))
 
-    -- Known player alerts (only when new known players appear in the group)
-    if #knownPlayers > 0 then
+    -- Known player alerts (joins, leaves, and self-joins)
+    if db.settings.knownAlerts then
         local now = time()
-        -- Build a fingerprint of the alert set
+
+        -- Build fingerprint and set of current known players
+        local currentSet = {}
         local fingerprint = {}
-        for _, kp in ipairs(knownPlayers) do fingerprint[#fingerprint + 1] = kp.key end
+        for _, kp in ipairs(knownPlayers) do
+            currentSet[kp.key] = true
+            fingerprint[#fingerprint + 1] = kp.key
+        end
         table.sort(fingerprint)
         local fpStr = table.concat(fingerprint, ",")
 
-        -- Only alert if genuinely NEW known players appeared (not just removals)
-        -- Same set = skip (avoids false alerts from level-ups, zone changes, etc.)
+        -- Only process if the group composition actually changed
         if fpStr ~= lastAlertKeys then
-            -- Check whether any current player is new (was not in previous set)
-            local hasNew = false
+            local isSelfJoin = (lastAlertKeys == "")
+
+            -- Detect new arrivals (known players who just joined)
+            local newArrivals = {}
             for _, kp in ipairs(knownPlayers) do
                 if not lastAlertSet[kp.key] then
-                    hasNew = true
-                    break
+                    newArrivals[#newArrivals + 1] = kp
                 end
             end
 
-            -- Always update the tracked state
+            -- Detect departures (known players who left)
+            local departedPlayers = {}
+            if not isSelfJoin then
+                for prevKey, _ in pairs(lastAlertSet) do
+                    if not currentSet[prevKey] then
+                        local p = db.players[prevKey]
+                        if p then
+                            departedPlayers[#departedPlayers + 1] = { key = prevKey, player = p }
+                        end
+                    end
+                end
+            end
+
+            -- Update tracking state
             lastAlertKeys = fpStr
             lastAlertTime = now
-            lastAlertSet = {}
-            for _, kp in ipairs(knownPlayers) do lastAlertSet[kp.key] = true end
+            lastAlertSet = currentSet
 
-            -- Only notify when someone new joined, not when someone left
-            if hasNew then
-                -- Always show in chat
+            -- Determine if we should alert for joins
+            local shouldAlertJoin = false
+            if #newArrivals > 0 then
+                if isSelfJoin then
+                    shouldAlertJoin = db.settings.alertOnSelfJoin
+                else
+                    shouldAlertJoin = db.settings.alertOnJoin
+                end
+            end
+
+            -- Show join alerts
+            if shouldAlertJoin then
                 P("|cFFFFFFFFKnown players in your group:|r")
                 for _, kp in ipairs(knownPlayers) do
                     local p = kp.player
@@ -3417,7 +3524,6 @@ local function ScanGroupMembers()
                     local ratingStr = ColorRating(p.rating or 0)
                     local noteStr = (p.note and p.note ~= "") and ("  |cFFBBBBBB\"" .. p.note .. "\"|r") or ""
 
-                    -- Special warning line for blacklisted players
                     if p.rating and p.rating <= -3 then
                         P("  |cFFFF0000>>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
                     else
@@ -3425,16 +3531,36 @@ local function ScanGroupMembers()
                     end
                 end
 
-                -- Additionally show popup if enabled
                 if db.settings.alertPopup then
-                    ShowAlertPopup(knownPlayers)
+                    ShowAlertPopup(knownPlayers, "join")
                 else
-                    -- Sound without popup: play sound based on whether any blacklisted
                     local hasBlacklist = false
                     for _, kp in ipairs(knownPlayers) do
                         if kp.player.rating and kp.player.rating <= -3 then hasBlacklist = true; break end
                     end
                     PlayAlertSound(hasBlacklist)
+                end
+            end
+
+            -- Show leave alerts
+            if db.settings.alertOnLeave and #departedPlayers > 0 then
+                P("|cFFFF8800Known players left your group:|r")
+                for _, kp in ipairs(departedPlayers) do
+                    local p = kp.player
+                    local cc = ClassColor(p.class)
+                    local ratingStr = ColorRating(p.rating or 0)
+                    local noteStr = (p.note and p.note ~= "") and ("  |cFFBBBBBB\"" .. p.note .. "\"|r") or ""
+
+                    if p.rating and p.rating <= -3 then
+                        P("  |cFFFF0000[BLACKLISTED]|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+                    else
+                        P("  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+                    end
+                end
+
+                -- Show leave popup only if we didn't already show a join popup
+                if db.settings.alertPopup and not shouldAlertJoin then
+                    ShowAlertPopup(departedPlayers, "leave")
                 end
             end
         end
