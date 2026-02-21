@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.1
+
+### Improvements
+- Chat notification when new players are added to the inbox
+- Chat reminder with inbox count when leaving a group
+- Alert popup panel now disabled by default for new installs
+
 ## v0.5.0
 
 ### New Features

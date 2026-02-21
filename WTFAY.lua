@@ -1,9 +1,9 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.5.0
+-- WTFAY - Who The F* Are You?   v0.5.1
 -- Database, slash commands, browse UI, rating, notes
 ----------------------------------------------------------------------
 local ADDON_NAME = "WTFAY"
-local ADDON_VERSION = "0.5.0"
+local ADDON_VERSION = "0.5.1"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
@@ -117,7 +117,7 @@ local SETTINGS_DEFAULTS = {
     alertOnJoin      = true,   -- Alert when a known player joins the group
     alertOnLeave     = true,   -- Alert when a known player leaves the group
     alertOnMeJoin    = true,   -- Alert when I join a group with known players
-    alertPopup       = true,   -- Also show a popup panel (not just chat)
+    alertPopup       = false,  -- Also show a popup panel (not just chat)
     alertSound       = true,   -- Play a sound when the alert popup appears
     alertSoundChoice = 1,      -- Index into ALERT_SOUNDS (default: Quest Complete)
     alertSkipGuild   = true,   -- Skip guild members from known player alerts
@@ -3820,6 +3820,10 @@ local function ScanGroupMembers()
         -- Left group: reset alert state so next join triggers fresh
         lastAlertSet = {}
         lastScanMembers = nil
+        local inboxCount = GetInboxCount()
+        if inboxCount > 0 then
+            P("|cFFFF8800" .. inboxCount .. "|r player" .. (inboxCount == 1 and "" or "s") .. " in your inbox to review. Type |cFFFFD100/wtfay|r to open.")
+        end
         RefreshList()
         if RefreshInbox then RefreshInbox() end
         UpdateInboxTabLabel()
@@ -3862,6 +3866,9 @@ local function ScanGroupMembers()
                 encounters = {}, pending = true,
             }
             LogEncounter(key, source, zone)
+            D("New player added to inbox: " .. name)
+            P(ClassColor(className) .. name .. "|r added to inbox.")
+            UpdateInboxTabLabel()
         end
 
         -- Collect for alert if this player was already in the database
