@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.2
+
+### Improvements
+- Version bump with clean commit history
+
 ## v0.5.1
 
 ### Improvements

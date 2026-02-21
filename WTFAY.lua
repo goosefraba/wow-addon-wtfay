@@ -1,9 +1,9 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.5.1
+-- WTFAY - Who The F* Are You?   v0.5.2
 -- Database, slash commands, browse UI, rating, notes
 ----------------------------------------------------------------------
 local ADDON_NAME = "WTFAY"
-local ADDON_VERSION = "0.5.1"
+local ADDON_VERSION = "0.5.2"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED

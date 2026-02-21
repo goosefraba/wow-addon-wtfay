@@ -2,7 +2,7 @@
 ## Title: WTFAY - Who The F* Are You?
 ## Notes: Track, rate, and remember every player you encounter.
 ## Author: goosefraba
-## Version: 0.5.1
+## Version: 0.5.2
 ## SavedVariables: WTFAYDB
 
 WTFAY.lua
