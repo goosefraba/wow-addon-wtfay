@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.0
+
+### New Features
+- **Player Inbox** — New players are now collected in a review queue instead of going straight into your database. Rate or add a note to move them to the database, or dismiss them entirely. Dismissed players reappear if you group with them again.
+- **Inbox Tab** — Main window now has "Database" and "Inbox" tabs with a prominent badge count showing pending players
+- **Tabbed Settings** — Settings panel split into 3 tabs (General, Alerts, Display) for a cleaner layout
+- **Alert Trigger Settings** — 3 new checkboxes to control when alerts fire: player joins, player leaves, or when you join a group with known players
+- **Default Sort: Last Seen** — Player list now defaults to sorting by last seen (newest first)
+
+### Improvements
+- Improved settings panel spacing to prevent text overlap
+- Settings panel is more compact thanks to the tabbed layout
+- Stats and export now correctly exclude inbox (pending) players
+
 ## v0.4.2
 
 ### New Features

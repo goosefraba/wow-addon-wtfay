@@ -1,9 +1,9 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.4.2
+-- WTFAY - Who The F* Are You?   v0.5.0
 -- Database, slash commands, browse UI, rating, notes
 ----------------------------------------------------------------------
 local ADDON_NAME = "WTFAY"
-local ADDON_VERSION = "0.4.2"
+local ADDON_VERSION = "0.5.0"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
@@ -113,7 +113,10 @@ local ALERT_SOUNDS = {
 local SETTINGS_DEFAULTS = {
     debug            = false,
     autoTrack        = true,
-    knownAlerts      = true,   -- Notify when known players join your group
+    knownAlerts      = true,   -- Master toggle for known player alerts
+    alertOnJoin      = true,   -- Alert when a known player joins the group
+    alertOnLeave     = true,   -- Alert when a known player leaves the group
+    alertOnMeJoin    = true,   -- Alert when I join a group with known players
     alertPopup       = true,   -- Also show a popup panel (not just chat)
     alertSound       = true,   -- Play a sound when the alert popup appears
     alertSoundChoice = 1,      -- Index into ALERT_SOUNDS (default: Quest Complete)
@@ -249,8 +252,8 @@ local sortedKeys = {}
 
 -- Sort state: field = "name"|"rating"|"class"|"level"|"source"|"seen"
 -- direction = "asc" | "desc"
-local sortField     = "name"
-local sortDirection  = "asc"
+local sortField     = "seen"
+local sortDirection  = "desc"
 
 local function RebuildSorted(filterText, ratingMin, ratingMax, sourceFilter, classFilter)
     wipe(sortedKeys)
@@ -258,8 +261,10 @@ local function RebuildSorted(filterText, ratingMin, ratingMax, sourceFilter, cla
     local classLower = classFilter and classFilter:lower() or nil
     for key, p in pairs(db.players) do
         local match = true
+        -- Skip pending (inbox) players
+        if p.pending then match = false end
         -- Text search: name only
-        if filterText ~= "" and not p.name:lower():find(filterText, 1, true) then
+        if match and filterText ~= "" and not p.name:lower():find(filterText, 1, true) then
             match = false
         end
         -- Rating range filter
@@ -422,13 +427,96 @@ closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
 D("title + close OK")
 
 ----------------------------------------------------------------------
+-- Main window tabs: Database / Inbox
+----------------------------------------------------------------------
+local mainTabButtons = {}
+local dbElements = {}  -- database-specific UI elements to show/hide
+local inboxContent     -- forward declare
+local RefreshInbox     -- forward declare
+
+local function GetInboxCount()
+    if not db or not db.players then return 0 end
+    local n = 0
+    for _, p in pairs(db.players) do
+        if p.pending then n = n + 1 end
+    end
+    return n
+end
+
+local function UpdateInboxTabLabel()
+    if mainTabButtons["Inbox"] then
+        local count = GetInboxCount()
+        if count > 0 then
+            mainTabButtons["Inbox"].label:SetText("Inbox (|cFFFF8800" .. count .. "|r)")
+        else
+            mainTabButtons["Inbox"].label:SetText("Inbox")
+        end
+    end
+end
+
+local activeMainTab = "Database"
+local function ShowMainTab(name)
+    activeMainTab = name
+    for tname, btn in pairs(mainTabButtons) do
+        if tname == name then
+            btn.label:SetTextColor(1, 0.82, 0.1)
+            btn.underline:Show()
+        else
+            btn.label:SetTextColor(0.6, 0.6, 0.6)
+            btn.underline:Hide()
+        end
+    end
+    -- Show/hide database elements
+    local showDb = (name == "Database")
+    for _, el in ipairs(dbElements) do
+        if showDb then el:Show() else el:Hide() end
+    end
+    -- Show/hide inbox
+    if inboxContent then
+        if name == "Inbox" then
+            inboxContent:Show()
+            if RefreshInbox then RefreshInbox() end
+        else
+            inboxContent:Hide()
+        end
+    end
+end
+
+do
+    local MAIN_TAB_NAMES = { "Database", "Inbox" }
+    local tabW = 80
+    local totalW = tabW * #MAIN_TAB_NAMES
+    local sx = (MIN_W - totalW) / 2  -- will be re-centered on resize but good enough
+    for i, tname in ipairs(MAIN_TAB_NAMES) do
+        local btn = CreateFrame("Button", nil, f)
+        btn:SetSize(tabW, 18)
+        btn:SetPoint("TOPLEFT", f, "TOPLEFT", 60 + (i - 1) * (tabW + 8), -34)
+        local lbl = btn:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lbl:SetPoint("CENTER", btn, "CENTER", 0, 0)
+        lbl:SetText(tname)
+        btn.label = lbl
+        local ul = btn:CreateTexture(nil, "ARTWORK")
+        ul:SetHeight(2)
+        ul:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", 4, 0)
+        ul:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -4, 0)
+        if ul.SetColorTexture then ul:SetColorTexture(0.9, 0.7, 0.2, 1) else ul:SetTexture(0.9, 0.7, 0.2, 1) end
+        ul:Hide()
+        btn.underline = ul
+        btn:SetScript("OnClick", function() ShowMainTab(tname) end)
+        mainTabButtons[tname] = btn
+    end
+end
+
+D("main tabs OK")
+
+----------------------------------------------------------------------
 -- Search bar
 ----------------------------------------------------------------------
 D("creating search box...")
 local searchBox = CreateFrame("EditBox", "WTFAYSearchBox", f, "InputBoxTemplate")
 D("search box created")
 searchBox:SetSize(120, 22)
-searchBox:SetPoint("TOPLEFT", f, "TOPLEFT", 58, -40)
+searchBox:SetPoint("TOPLEFT", f, "TOPLEFT", 58, -56)
 searchBox:SetAutoFocus(false)
 searchBox:SetFontObject(ChatFontNormal)
 searchBox:SetMaxLetters(40)
@@ -567,7 +655,7 @@ D("class filter button OK")
 -- Player count label
 ----------------------------------------------------------------------
 local countLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-countLabel:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -44)
+countLabel:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -60)
 countLabel:SetJustifyH("RIGHT")
 
 D("count label OK")
@@ -577,7 +665,7 @@ D("count label OK")
 ----------------------------------------------------------------------
 local HEADER_HEIGHT = 20
 local headerBar = CreateFrame("Frame", nil, f)
-headerBar:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -66)
+headerBar:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -82)
 headerBar:SetPoint("RIGHT", f, "RIGHT", -30, 0)
 headerBar:SetHeight(HEADER_HEIGHT)
 
@@ -1002,6 +1090,8 @@ RefreshList = function()
     for i = visibleRows + 1, #rows do
         rows[i]:Hide()
     end
+
+    UpdateInboxTabLabel()
 end
 
 scrollFrame:SetScript("OnVerticalScroll", function(self, offset)
@@ -1059,14 +1149,183 @@ f:SetScript("OnShow", function()
       .. " width=" .. tostring(scrollParent:GetWidth())
       .. " content height=" .. tostring(content:GetHeight())
       .. " width=" .. tostring(content:GetWidth()))
+    -- Activate current tab and refresh
+    ShowMainTab(activeMainTab)
     -- Delay refresh slightly to let layout settle
     C_Timer.After(0.05, function()
         D("OnShow delayed refresh: scrollParent height=" .. tostring(scrollParent:GetHeight()))
-        RefreshList()
+        if activeMainTab == "Database" then
+            RefreshList()
+        elseif RefreshInbox then
+            RefreshInbox()
+        end
     end)
 end)
 
 D("refresh list code OK")
+
+-- Register database-specific UI elements for tab switching
+dbElements = { searchBox, searchLabel, ratingFilterBtn, sourceFilterBtn, classFilterBtn, countLabel, headerBar, scrollParent, scrollFrame, content }
+
+----------------------------------------------------------------------
+-- Inbox tab content
+----------------------------------------------------------------------
+do
+    inboxContent = CreateFrame("Frame", nil, f)
+    inboxContent:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -56)
+    inboxContent:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 42)
+    inboxContent:Hide()
+
+    local inboxTitle = inboxContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    inboxTitle:SetPoint("TOPLEFT", inboxContent, "TOPLEFT", 4, -4)
+    inboxTitle:SetText("|cFFAAAAAAPlayers to review — rate or dismiss:|r")
+
+    local INBOX_ROW_HEIGHT = 36
+    local inboxScrollParent = CreateFrame("Frame", nil, inboxContent)
+    inboxScrollParent:SetPoint("TOPLEFT", inboxContent, "TOPLEFT", 0, -24)
+    inboxScrollParent:SetPoint("BOTTOMRIGHT", inboxContent, "BOTTOMRIGHT", -18, 0)
+
+    local inboxScrollFrame = CreateFrame("ScrollFrame", "WTFAYInboxScrollFrame", inboxContent, "FauxScrollFrameTemplate")
+    inboxScrollFrame:SetPoint("TOPLEFT", inboxScrollParent, "TOPLEFT", 0, 0)
+    inboxScrollFrame:SetPoint("BOTTOMRIGHT", inboxScrollParent, "BOTTOMRIGHT", 0, 0)
+
+    local inboxContentFrame = CreateFrame("Frame", nil, inboxContent)
+    inboxContentFrame:SetPoint("TOPLEFT", inboxScrollParent, "TOPLEFT", 0, 0)
+    inboxContentFrame:SetPoint("BOTTOMRIGHT", inboxScrollParent, "BOTTOMRIGHT", 0, 0)
+
+    local inboxRows = {}
+    local inboxSortedKeys = {}
+
+    local function RebuildInboxSorted()
+        wipe(inboxSortedKeys)
+        if not db or not db.players then return end
+        for key, p in pairs(db.players) do
+            if p.pending then
+                inboxSortedKeys[#inboxSortedKeys + 1] = key
+            end
+        end
+        -- Sort by last seen, newest first
+        table.sort(inboxSortedKeys, function(a, b)
+            local pa, pb = db.players[a], db.players[b]
+            if not pa or not pb then return a < b end
+            return (pa.seen or "") > (pb.seen or "")
+        end)
+    end
+
+    local function CreateInboxRow(index)
+        local row = CreateFrame("Frame", nil, inboxContentFrame)
+        row:SetHeight(INBOX_ROW_HEIGHT)
+        row:SetPoint("TOPLEFT", inboxContentFrame, "TOPLEFT", 0, -((index - 1) * INBOX_ROW_HEIGHT))
+        row:SetPoint("RIGHT", inboxContentFrame, "RIGHT", 0, 0)
+
+        if BackdropTemplateMixin then Mixin(row, BackdropTemplateMixin); row:OnBackdropLoaded() end
+        if row.SetBackdrop then
+            row:SetBackdrop({
+                bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+                edgeFile = nil, tile = true, tileSize = 16,
+            })
+            row:SetBackdropColor(0.1, 0.1, 0.13, 0.8)
+        end
+
+        row.nameText = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        row.nameText:SetPoint("TOPLEFT", row, "TOPLEFT", 6, -4)
+
+        row.infoText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        row.infoText:SetPoint("TOPLEFT", row.nameText, "BOTTOMLEFT", 0, -1)
+        row.infoText:SetText("")
+
+        -- Dismiss button
+        row.dismissBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        row.dismissBtn:SetSize(54, 20)
+        row.dismissBtn:SetPoint("RIGHT", row, "RIGHT", -4, 0)
+        row.dismissBtn:SetText("Dismiss")
+        row.dismissBtn:SetScript("OnClick", function()
+            if row.playerKey and db and db.players then
+                db.players[row.playerKey] = nil
+                if RefreshInbox then RefreshInbox() end
+                UpdateInboxTabLabel()
+            end
+        end)
+
+        -- Rate button
+        row.rateBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        row.rateBtn:SetSize(42, 20)
+        row.rateBtn:SetPoint("RIGHT", row.dismissBtn, "LEFT", -4, 0)
+        row.rateBtn:SetText("Rate")
+        row.rateBtn:SetScript("OnClick", function()
+            if row.playerKey and ShowRatingPicker then
+                ShowRatingPicker(row.playerKey)
+            end
+        end)
+
+        return row
+    end
+
+    RefreshInbox = function()
+        if not db then return end
+        RebuildInboxSorted()
+
+        local parentH = inboxScrollParent:GetHeight()
+        if parentH < 1 then parentH = 200 end
+        local visibleRows = math.floor(parentH / INBOX_ROW_HEIGHT)
+        if visibleRows < 1 then visibleRows = 1 end
+
+        local total = #inboxSortedKeys
+        FauxScrollFrame_Update(inboxScrollFrame, total, visibleRows, INBOX_ROW_HEIGHT)
+        local offset = FauxScrollFrame_GetOffset(inboxScrollFrame)
+
+        for i = 1, visibleRows do
+            local row = inboxRows[i]
+            if not row then
+                row = CreateInboxRow(i)
+                inboxRows[i] = row
+            end
+            local dataIdx = offset + i
+            if dataIdx <= total then
+                local key = inboxSortedKeys[dataIdx]
+                local p = db.players[key]
+                if p then
+                    local cc = ClassColor(p.class)
+                    row.nameText:SetText(cc .. (p.name or "?") .. "|r")
+                    local parts = {}
+                    if p.level and p.level > 0 then parts[#parts + 1] = "Lv" .. p.level end
+                    if p.race and p.race ~= "" then parts[#parts + 1] = p.race end
+                    if p.class and p.class ~= "" then parts[#parts + 1] = p.class end
+                    local _, srcDisplay = GetPlayerSources(p)
+                    if srcDisplay ~= "" then parts[#parts + 1] = srcDisplay end
+                    if p.seen then parts[#parts + 1] = "|cFF666666" .. p.seen .. "|r" end
+                    row.infoText:SetText("|cFFAAAAAA" .. table.concat(parts, "  ") .. "|r")
+                    row.playerKey = key
+                    -- Alternate row colors
+                    if row.SetBackdropColor then
+                        if i % 2 == 0 then
+                            row:SetBackdropColor(0.12, 0.12, 0.15, 0.8)
+                        else
+                            row:SetBackdropColor(0.08, 0.08, 0.10, 0.8)
+                        end
+                    end
+                    row:Show()
+                else
+                    row:Hide()
+                end
+            else
+                row:Hide()
+            end
+        end
+
+        for i = visibleRows + 1, #inboxRows do
+            inboxRows[i]:Hide()
+        end
+
+        UpdateInboxTabLabel()
+    end
+
+    inboxScrollFrame:SetScript("OnVerticalScroll", function(self, offset)
+        FauxScrollFrame_OnVerticalScroll(self, offset, INBOX_ROW_HEIGHT, RefreshInbox)
+    end)
+end
+
+D("inbox tab OK")
 
 -- Forward declaration for minimap button (created after settings, referenced by settings toggles)
 local minimapBtn
@@ -1078,7 +1337,7 @@ local settingsPanel = {}
 
 do
     local sp = CreateFrame("Frame", "WTFAYSettingsPanel", UIParent)
-    sp:SetSize(280, 470)
+    sp:SetSize(280, 460)
     sp:SetPoint("CENTER", UIParent, "CENTER", 0, 60)
     sp:SetFrameStrata("FULLSCREEN_DIALOG")
     sp:SetMovable(true)
@@ -1118,13 +1377,80 @@ do
     spTitle:SetPoint("TOP", sp, "TOP", 0, -14)
     spTitle:SetText("|cFF" .. ACCENT .. "WTFAY Settings|r")
 
+    ----------------------------------------------------------------
+    -- Tab bar
+    ----------------------------------------------------------------
+    local TAB_NAMES = { "General", "Alerts", "Display" }
+    local tabButtons = {}
+    local tabContents = {}
+    local activeTab = "General"
+
+    local tabWidth = 80
+    local tabBarY = -36
+    local totalWidth = tabWidth * #TAB_NAMES
+    local startX = (280 - totalWidth) / 2
+
+    for i, name in ipairs(TAB_NAMES) do
+        local btn = CreateFrame("Button", nil, sp)
+        btn:SetSize(tabWidth, 20)
+        btn:SetPoint("TOPLEFT", sp, "TOPLEFT", startX + (i - 1) * tabWidth, tabBarY)
+
+        local label = btn:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        label:SetPoint("CENTER", btn, "CENTER", 0, 0)
+        label:SetText(name)
+        btn.label = label
+
+        local underline = btn:CreateTexture(nil, "ARTWORK")
+        underline:SetHeight(2)
+        underline:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", 4, 0)
+        underline:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -4, 0)
+        underline:SetColorTexture(0.9, 0.7, 0.2, 1)
+        underline:Hide()
+        btn.underline = underline
+
+        btn:SetScript("OnClick", function()
+            activeTab = name
+            for _, n in ipairs(TAB_NAMES) do
+                if tabContents[n] then
+                    if n == name then tabContents[n]:Show() else tabContents[n]:Hide() end
+                end
+                if tabButtons[n] then
+                    if n == name then
+                        tabButtons[n].label:SetTextColor(1, 0.82, 0.1)
+                        tabButtons[n].underline:Show()
+                    else
+                        tabButtons[n].label:SetTextColor(0.6, 0.6, 0.6)
+                        tabButtons[n].underline:Hide()
+                    end
+                end
+            end
+        end)
+
+        tabButtons[name] = btn
+    end
+
+    -- Content frames (one per tab)
+    for _, name in ipairs(TAB_NAMES) do
+        local cf = CreateFrame("Frame", nil, sp)
+        cf:SetPoint("TOPLEFT", sp, "TOPLEFT", 0, tabBarY - 24)
+        cf:SetPoint("BOTTOMRIGHT", sp, "BOTTOMRIGHT", 0, 60)
+        cf:Hide()
+        tabContents[name] = cf
+    end
+
+    -- Show default tab
+    local function ShowTab(name)
+        tabButtons[name]:GetScript("OnClick")()
+    end
+
+    ----------------------------------------------------------------
     -- Helper: create a toggle row (checkbox + label + description)
+    ----------------------------------------------------------------
     local function CreateToggle(parent, yOffset, label, description, getter, setter)
         local row = CreateFrame("CheckButton", nil, parent)
         row:SetSize(24, 24)
         row:SetPoint("TOPLEFT", parent, "TOPLEFT", 16, yOffset)
 
-        -- Checkbox texture (use built-in template)
         row:SetNormalTexture("Interface\\Buttons\\UI-CheckBox-Up")
         row:SetPushedTexture("Interface\\Buttons\\UI-CheckBox-Down")
         row:SetHighlightTexture("Interface\\Buttons\\UI-CheckBox-Highlight", "ADD")
@@ -1153,8 +1479,12 @@ do
         return row
     end
 
-    -- Toggle: Debug Mode
-    local debugToggle = CreateToggle(sp, -42,
+    ----------------------------------------------------------------
+    -- Tab: General
+    ----------------------------------------------------------------
+    local gc = tabContents["General"]
+
+    local debugToggle = CreateToggle(gc, -10,
         "Debug Logging",
         "Show verbose debug messages in chat. Useful for troubleshooting.",
         function() return DEBUG end,
@@ -1165,8 +1495,7 @@ do
         end
     )
 
-    -- Toggle: Auto-Track
-    local autoTrackToggle = CreateToggle(sp, -90,
+    local autoTrackToggle = CreateToggle(gc, -60,
         "Auto-Track Party Members",
         "Automatically add or update players when you join a party, raid, or dungeon.",
         function() return db and db.settings and db.settings.autoTrack or false end,
@@ -1176,10 +1505,14 @@ do
         end
     )
 
-    -- Toggle: Known Player Alerts
-    local knownAlertsToggle = CreateToggle(sp, -138,
+    ----------------------------------------------------------------
+    -- Tab: Alerts
+    ----------------------------------------------------------------
+    local ac = tabContents["Alerts"]
+
+    local knownAlertsToggle = CreateToggle(ac, -10,
         "Known Player Alerts",
-        "Show a chat notification when known players join your group.",
+        "Master toggle for all known player notifications.",
         function() return db and db.settings and db.settings.knownAlerts or false end,
         function(val)
             if db and db.settings then db.settings.knownAlerts = val end
@@ -1187,8 +1520,37 @@ do
         end
     )
 
-    -- Toggle: Alert Popup Panel
-    local alertPopupToggle = CreateToggle(sp, -186,
+    local alertJoinToggle = CreateToggle(ac, -48,
+        "  Player Joins",
+        "Alert when a known player joins your group.",
+        function() return db and db.settings and db.settings.alertOnJoin or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnJoin = val end
+            P("Alert on join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    local alertLeaveToggle = CreateToggle(ac, -86,
+        "  Player Leaves",
+        "Alert when a known player leaves your group.",
+        function() return db and db.settings and db.settings.alertOnLeave or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnLeave = val end
+            P("Alert on leave: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    local alertMeJoinToggle = CreateToggle(ac, -124,
+        "  I Join a Group",
+        "Alert when you join a group with known players already in it.",
+        function() return db and db.settings and db.settings.alertOnMeJoin or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnMeJoin = val end
+            P("Alert on me join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    local alertPopupToggle = CreateToggle(ac, -174,
         "Alert Popup Panel",
         "Also show a popup panel with known players (not just chat).",
         function() return db and db.settings and db.settings.alertPopup or false end,
@@ -1198,8 +1560,7 @@ do
         end
     )
 
-    -- Toggle: Alert Sound
-    local alertSoundToggle = CreateToggle(sp, -234,
+    local alertSoundToggle = CreateToggle(ac, -224,
         "Alert Sound",
         "Play a sound when the known player alert appears.",
         function() return db and db.settings and db.settings.alertSound or false end,
@@ -1210,11 +1571,11 @@ do
     )
 
     -- Sound picker label + dropdown + preview button
-    local soundLabel = sp:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    soundLabel:SetPoint("TOPLEFT", sp, "TOPLEFT", 22, -268)
+    local soundLabel = ac:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    soundLabel:SetPoint("TOPLEFT", ac, "TOPLEFT", 22, -268)
     soundLabel:SetText("|cFFBBBBBBSound:|r")
 
-    local soundDropdown = CreateFrame("Frame", "WTFAYSoundDropdownStandalone", sp, "UIDropDownMenuTemplate")
+    local soundDropdown = CreateFrame("Frame", "WTFAYSoundDropdownStandalone", ac, "UIDropDownMenuTemplate")
     soundDropdown:SetPoint("LEFT", soundLabel, "RIGHT", -8, -2)
     UIDropDownMenu_SetWidth(soundDropdown, 130)
 
@@ -1227,7 +1588,6 @@ do
                 if db and db.settings then db.settings.alertSoundChoice = i end
                 UIDropDownMenu_SetSelectedValue(soundDropdown, i)
                 UIDropDownMenu_SetText(soundDropdown, s.name)
-                -- Preview the sound
                 PlaySound(s.normal)
             end
             info.checked = (db and db.settings and db.settings.alertSoundChoice == i)
@@ -1236,7 +1596,7 @@ do
     end
     UIDropDownMenu_Initialize(soundDropdown, SoundDropdown_Init)
 
-    local previewBtn = CreateFrame("Button", nil, sp, "UIPanelButtonTemplate")
+    local previewBtn = CreateFrame("Button", nil, ac, "UIPanelButtonTemplate")
     previewBtn:SetSize(40, 22)
     previewBtn:SetPoint("LEFT", soundDropdown, "RIGHT", -4, 2)
     previewBtn:SetText("Test")
@@ -1252,8 +1612,7 @@ do
     end)
     previewBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-    -- Toggle: Skip Guild Members in Alerts
-    local skipGuildToggle = CreateToggle(sp, -300,
+    local skipGuildToggle = CreateToggle(ac, -304,
         "Skip Guild Members in Alerts",
         "Don't show alerts for players in your guild.",
         function() return db and db.settings and db.settings.alertSkipGuild or false end,
@@ -1263,8 +1622,12 @@ do
         end
     )
 
-    -- Toggle: Minimap Button
-    local minimapToggle = CreateToggle(sp, -348,
+    ----------------------------------------------------------------
+    -- Tab: Display
+    ----------------------------------------------------------------
+    local dc = tabContents["Display"]
+
+    local minimapToggle = CreateToggle(dc, -10,
         "Minimap Button",
         "Show the WTFAY icon on your minimap.",
         function() return not (db and db.minimapHidden) end,
@@ -1275,12 +1638,13 @@ do
         end
     )
 
-    -- About / credit
+    ----------------------------------------------------------------
+    -- Common: About + Done (always visible)
+    ----------------------------------------------------------------
     local aboutLabel = sp:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     aboutLabel:SetPoint("BOTTOM", sp, "BOTTOM", 0, 38)
     aboutLabel:SetText("|cFF888888v" .. ADDON_VERSION .. "  -  Developed by |r|cFF" .. ACCENT .. "goosefraba|r")
 
-    -- Done button
     local doneBtn = CreateFrame("Button", nil, sp, "UIPanelButtonTemplate")
     doneBtn:SetSize(80, 22)
     doneBtn:SetPoint("BOTTOM", sp, "BOTTOM", 0, 12)
@@ -1292,14 +1656,17 @@ do
         debugToggle.Refresh()
         autoTrackToggle.Refresh()
         knownAlertsToggle.Refresh()
+        alertJoinToggle.Refresh()
+        alertLeaveToggle.Refresh()
+        alertMeJoinToggle.Refresh()
         alertPopupToggle.Refresh()
         alertSoundToggle.Refresh()
         skipGuildToggle.Refresh()
         minimapToggle.Refresh()
-        -- Refresh sound dropdown selection
         local idx = db and db.settings and db.settings.alertSoundChoice or 1
         UIDropDownMenu_SetSelectedValue(soundDropdown, idx)
         UIDropDownMenu_SetText(soundDropdown, (ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]).name)
+        ShowTab(activeTab)
     end)
 
     -- Public interface
@@ -1307,6 +1674,9 @@ do
         if sp:IsShown() then sp:Hide() else sp:Show() end
     end
     settingsPanel.frame = sp
+
+    -- Initialize default tab
+    ShowTab("General")
 end
 
 D("settings panel OK")
@@ -1385,10 +1755,10 @@ do
         end
     )
 
-    -- Known player alerts toggle
+    -- Known player alerts toggle (master)
     local optKnownAlerts = BlizCheckbox(optPanel, -160,
         "Known Player Alerts",
-        "Show a chat notification when known players join your group.",
+        "Master toggle for all known player notifications.",
         function() return db and db.settings and db.settings.knownAlerts or false end,
         function(val)
             if db and db.settings then db.settings.knownAlerts = val end
@@ -1396,8 +1766,41 @@ do
         end
     )
 
+    -- Sub-toggle: Player Joins
+    local optAlertJoin = BlizCheckbox(optPanel, -198,
+        "  Player Joins",
+        "Alert when a known player joins your group.",
+        function() return db and db.settings and db.settings.alertOnJoin or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnJoin = val end
+            P("Alert on join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Sub-toggle: Player Leaves
+    local optAlertLeave = BlizCheckbox(optPanel, -236,
+        "  Player Leaves",
+        "Alert when a known player leaves your group.",
+        function() return db and db.settings and db.settings.alertOnLeave or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnLeave = val end
+            P("Alert on leave: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
+    -- Sub-toggle: I Join Group
+    local optAlertMeJoin = BlizCheckbox(optPanel, -274,
+        "  I Join a Group",
+        "Alert when you join a group with known players already in it.",
+        function() return db and db.settings and db.settings.alertOnMeJoin or false end,
+        function(val)
+            if db and db.settings then db.settings.alertOnMeJoin = val end
+            P("Alert on me join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        end
+    )
+
     -- Alert popup toggle
-    local optAlertPopup = BlizCheckbox(optPanel, -210,
+    local optAlertPopup = BlizCheckbox(optPanel, -324,
         "Alert Popup Panel",
         "Also show a popup panel with known players (not just chat).",
         function() return db and db.settings and db.settings.alertPopup or false end,
@@ -1408,7 +1811,7 @@ do
     )
 
     -- Alert sound toggle
-    local optAlertSound = BlizCheckbox(optPanel, -260,
+    local optAlertSound = BlizCheckbox(optPanel, -374,
         "Alert Sound",
         "Play a sound when the known player alert appears.",
         function() return db and db.settings and db.settings.alertSound or false end,
@@ -1420,7 +1823,7 @@ do
 
     -- Sound picker dropdown (Blizzard panel)
     local optSoundLabel = optPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    optSoundLabel:SetPoint("TOPLEFT", optPanel, "TOPLEFT", 22, -296)
+    optSoundLabel:SetPoint("TOPLEFT", optPanel, "TOPLEFT", 22, -418)
     optSoundLabel:SetText("Sound:")
 
     local optSoundDropdown = CreateFrame("Frame", "WTFAYSoundDropdownBliz", optPanel, "UIDropDownMenuTemplate")
@@ -1461,7 +1864,7 @@ do
     optPreviewBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     -- Skip guild toggle
-    local optSkipGuild = BlizCheckbox(optPanel, -340,
+    local optSkipGuild = BlizCheckbox(optPanel, -462,
         "Skip Guild Members in Alerts",
         "Don't show alerts for players in your guild.",
         function() return db and db.settings and db.settings.alertSkipGuild or false end,
@@ -1472,7 +1875,7 @@ do
     )
 
     -- Minimap button toggle
-    local optMinimap = BlizCheckbox(optPanel, -390,
+    local optMinimap = BlizCheckbox(optPanel, -512,
         "Minimap Button",
         "Show the WTFAY icon on your minimap for quick access.",
         function() return not (db and db.minimapHidden) end,
@@ -1498,6 +1901,9 @@ do
         optDebug.Refresh()
         optAutoTrack.Refresh()
         optKnownAlerts.Refresh()
+        optAlertJoin.Refresh()
+        optAlertLeave.Refresh()
+        optAlertMeJoin.Refresh()
         optAlertPopup.Refresh()
         optAlertSound.Refresh()
         optSkipGuild.Refresh()
@@ -1727,19 +2133,21 @@ do
         local lines = {}
         lines[1] = "WTFAY_EXPORT_V2"  -- header for version detection
         for key, p in pairs(db.players) do
-            local parts = {
-                EscField(key),
-                EscField(p.name),
-                EscField(p.realm),
-                EscField(p.class),
-                EscField(p.race or ""),
-                tostring(p.level or 0),
-                tostring(p.rating or 0),
-                EscField(p.note or ""),
-                EscField(p.source or "manual"),
-                EscField(p.seen or ""),
-            }
-            lines[#lines + 1] = table.concat(parts, SEP)
+            if not p.pending then
+                local parts = {
+                    EscField(key),
+                    EscField(p.name),
+                    EscField(p.realm),
+                    EscField(p.class),
+                    EscField(p.race or ""),
+                    tostring(p.level or 0),
+                    tostring(p.rating or 0),
+                    EscField(p.note or ""),
+                    EscField(p.source or "manual"),
+                    EscField(p.seen or ""),
+                }
+                lines[#lines + 1] = table.concat(parts, SEP)
+            end
         end
         return table.concat(lines, "\n")
     end
@@ -2098,6 +2506,8 @@ do
         local classCounts = {}
 
         for _, p in pairs(db.players) do
+            if p.pending then -- skip inbox players from stats
+            else
             totalPlayers = totalPlayers + 1
             local r = p.rating or 0
             ratingSum = ratingSum + r
@@ -2121,6 +2531,7 @@ do
             if p.encounters then
                 totalEncounters = totalEncounters + #p.encounters
             end
+            end -- close else (skip pending)
         end
 
         local avgRating = totalPlayers > 0 and (ratingSum / totalPlayers) or 0
@@ -2388,8 +2799,15 @@ StaticPopupDialogs["WTFAY_EDIT_NOTE"] = {
             end
             D("WTFAY_EDIT_NOTE note='" .. note .. "'")
             db.players[key].note = note
-            P("Note updated for " .. db.players[key].name)
+            if note ~= "" and db.players[key].pending then
+                db.players[key].pending = nil
+                P("Note updated for " .. db.players[key].name .. " |cFF44FF44(moved to database)|r")
+            else
+                P("Note updated for " .. db.players[key].name)
+            end
             RefreshList()
+            if RefreshInbox then RefreshInbox() end
+            UpdateInboxTabLabel()
         end)
         if not ok then D("EDIT_NOTE OnAccept ERROR: " .. tostring(err)) end
     end,
@@ -2569,8 +2987,15 @@ for idx, btn in ipairs(ratingButtons) do
             D("RatingPicker click: val=" .. self.ratingValue .. " key=" .. tostring(key))
             if not key or not db or not db.players[key] then return end
             db.players[key].rating = self.ratingValue
-            P(db.players[key].name .. " rated " .. ColorRating(self.ratingValue))
+            if db.players[key].pending then
+                db.players[key].pending = nil
+                P(db.players[key].name .. " rated " .. ColorRating(self.ratingValue) .. " |cFF44FF44(moved to database)|r")
+            else
+                P(db.players[key].name .. " rated " .. ColorRating(self.ratingValue))
+            end
             RefreshList()
+            if RefreshInbox then RefreshInbox() end
+            UpdateInboxTabLabel()
             ratingPicker:Hide()
         end)
         if not ok then D("RatingPicker ERROR: " .. tostring(err)) end
@@ -2963,8 +3388,11 @@ local function RatePlayer(nameRealm, rating)
     end
     rating = math.max(-3, math.min(5, math.floor(rating)))
     db.players[key].rating = rating
+    if db.players[key].pending then db.players[key].pending = nil end
     P(ClassColor(db.players[key].class) .. name .. "|r rated " .. ColorRating(rating))
     RefreshList()
+    if RefreshInbox then RefreshInbox() end
+    UpdateInboxTabLabel()
 end
 
 local function NotePlayer(nameRealm, note)
@@ -3201,7 +3629,7 @@ alertDismiss:SetScript("OnClick", function() alertPopupFrame:Hide() end)
 -- Auto-dismiss timer (optional: fade out after 15 seconds)
 local alertTimer = nil
 
-local function ShowAlertPopup(knownPlayers)
+local function ShowAlertPopup(knownPlayers, isLeave)
     if not knownPlayers or #knownPlayers == 0 then return end
 
     -- Cancel previous timer
@@ -3216,7 +3644,12 @@ local function ShowAlertPopup(knownPlayers)
     end
 
     -- Title
-    if blacklistCount > 0 then
+    if isLeave then
+        alertTitle:SetText("|cFFAAAABBKnown Player Left|r")
+        if alertPopupFrame.SetBackdropColor then
+            alertPopupFrame:SetBackdropColor(0.06, 0.06, 0.08, 0.92)
+        end
+    elseif blacklistCount > 0 then
         alertTitle:SetText("|cFFFF4444!! Known Players Alert !!|r")
         if alertPopupFrame.SetBackdropColor then
             alertPopupFrame:SetBackdropColor(0.12, 0.02, 0.02, 0.96)
@@ -3296,11 +3729,12 @@ local function ShowAlertPopup(knownPlayers)
     -- Play alert sound if enabled
     PlayAlertSound(blacklistCount > 0)
 
-    -- Auto-dismiss after 20 seconds (unless blacklisted players, then stay)
-    if blacklistCount == 0 then
-        local dismissTime = time() + 20
+    -- Auto-dismiss: leave alerts after 10s, normal after 20s, blacklisted stays
+    local dismissSeconds = isLeave and 10 or (blacklistCount == 0 and 20 or nil)
+    if dismissSeconds then
+        local dismissTime = time() + dismissSeconds
         alertTimer = dismissTime
-        C_Timer.After(20, function()
+        C_Timer.After(dismissSeconds, function()
             if alertTimer == dismissTime and alertPopupFrame:IsShown() then
                 alertPopupFrame:Hide()
             end
@@ -3349,19 +3783,46 @@ local function GetGuildMemberSet()
     return guildSet
 end
 
--- Cooldown: track last alert set to avoid spamming the same alerts
-local lastAlertKeys = ""
-local lastAlertSet = {}   -- set of player keys for detecting genuinely new arrivals
-local lastAlertTime = 0
+-- Alert state tracking
+local lastAlertSet = {}       -- set of player keys seen this session (only grows)
+local lastScanMembers = nil   -- set of known player keys from previous scan (nil = first scan)
+
+-- Helper: show alert in chat and optionally popup/sound
+local function FireAlert(players, title, isLeave)
+    if #players == 0 then return end
+    P(title)
+    for _, kp in ipairs(players) do
+        local p = kp.player
+        local cc = ClassColor(p.class)
+        local ratingStr = ColorRating(p.rating or 0)
+        local noteStr = (p.note and p.note ~= "") and ("  |cFFBBBBBB\"" .. p.note .. "\"|r") or ""
+        if p.rating and p.rating <= -3 then
+            P("  |cFFFF0000>>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+        else
+            P("  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+        end
+    end
+    if db.settings.alertPopup then
+        ShowAlertPopup(players, isLeave)
+    else
+        local hasBlacklist = false
+        for _, kp in ipairs(players) do
+            if kp.player.rating and kp.player.rating <= -3 then hasBlacklist = true; break end
+        end
+        PlayAlertSound(hasBlacklist)
+    end
+end
 
 -- Scan all current group/raid members and add/update them
 local function ScanGroupMembers()
     if not db or not db.settings or not db.settings.autoTrack then return end
     if not IsInGroup() and not IsInRaid() then
-        -- Left group: reset alert fingerprint so next join triggers fresh
-        lastAlertKeys = ""
+        -- Left group: reset alert state so next join triggers fresh
         lastAlertSet = {}
-        lastAlertTime = 0
+        lastScanMembers = nil
+        RefreshList()
+        if RefreshInbox then RefreshInbox() end
+        UpdateInboxTabLabel()
         return
     end
 
@@ -3398,7 +3859,7 @@ local function ScanGroupMembers()
                 name = name, realm = realm, class = className,
                 race = raceName, level = level, rating = 0,
                 note = "", source = source, seen = Timestamp(),
-                encounters = {},
+                encounters = {}, pending = true,
             }
             LogEncounter(key, source, zone)
         end
@@ -3428,50 +3889,56 @@ local function ScanGroupMembers()
 
     D("ScanGroupMembers: source=" .. source .. " zone=" .. tostring(zone) .. " members=" .. tostring(numMembers))
 
-    -- Known player alerts (only when new known players appear in the group)
-    if #knownPlayers > 0 then
-        -- Check whether any current player is genuinely new (not seen before this session)
-        local newPlayers = {}
-        for _, kp in ipairs(knownPlayers) do
-            if not lastAlertSet[kp.key] then
-                newPlayers[#newPlayers + 1] = kp
+    -- Build current set of known player keys
+    local currentKnownSet = {}
+    for _, kp in ipairs(knownPlayers) do currentKnownSet[kp.key] = kp end
+
+    -- Determine alert context
+    local isFirstScan = (lastScanMembers == nil)
+
+    if db.settings.knownAlerts and #knownPlayers > 0 then
+        if isFirstScan then
+            -- I just joined a group — all known players are "already here"
+            if db.settings.alertOnMeJoin then
+                FireAlert(knownPlayers, "|cFFFFFFFFKnown players in your group:|r", false)
             end
-        end
-
-        -- Add all current players to the session set (only grows, never shrinks)
-        for _, kp in ipairs(knownPlayers) do lastAlertSet[kp.key] = true end
-
-        -- Only alert if there are genuinely new players (skip on leaves, level-ups, etc.)
-        if #newPlayers > 0 then
-            -- Always show in chat
-            P("|cFFFFFFFFKnown players in your group:|r")
-            for _, kp in ipairs(knownPlayers) do
-                local p = kp.player
-                local cc = ClassColor(p.class)
-                local ratingStr = ColorRating(p.rating or 0)
-                local noteStr = (p.note and p.note ~= "") and ("  |cFFBBBBBB\"" .. p.note .. "\"|r") or ""
-
-                -- Special warning line for blacklisted players
-                if p.rating and p.rating <= -3 then
-                    P("  |cFFFF0000>>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
-                else
-                    P("  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
-                end
-            end
-
-            -- Additionally show popup if enabled
-            if db.settings.alertPopup then
-                ShowAlertPopup(knownPlayers)
-            else
-                -- Sound without popup: play sound based on whether any blacklisted
-                local hasBlacklist = false
+        else
+            -- Ongoing group: detect joins and leaves
+            -- Joined: in current set but NOT in previous scan
+            if db.settings.alertOnJoin then
+                local joined = {}
                 for _, kp in ipairs(knownPlayers) do
-                    if kp.player.rating and kp.player.rating <= -3 then hasBlacklist = true; break end
+                    if not lastScanMembers[kp.key] then
+                        joined[#joined + 1] = kp
+                    end
                 end
-                PlayAlertSound(hasBlacklist)
+                if #joined > 0 then
+                    FireAlert(joined, "|cFFFFFFFFKnown player joined your group:|r", false)
+                end
+            end
+
+            -- Left: in previous scan but NOT in current set
+            if db.settings.alertOnLeave then
+                local left = {}
+                for prevKey, _ in pairs(lastScanMembers) do
+                    if not currentKnownSet[prevKey] then
+                        local p = db.players[prevKey]
+                        if p then
+                            left[#left + 1] = { key = prevKey, player = p }
+                        end
+                    end
+                end
+                if #left > 0 then
+                    FireAlert(left, "|cFFAAAAAAKnown player left your group:|r", true)
+                end
             end
         end
     end
+
+    -- Update tracking sets for next scan
+    lastScanMembers = {}
+    for _, kp in ipairs(knownPlayers) do lastScanMembers[kp.key] = true end
+    for _, kp in ipairs(knownPlayers) do lastAlertSet[kp.key] = true end
 
     RefreshList()
 end
