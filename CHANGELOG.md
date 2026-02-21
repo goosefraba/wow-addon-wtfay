@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.5.3
+
+### Bug Fixes
+- Fixed Last Seen and Source columns — Last Seen now displays in its own column instead of being merged with Source
+- Rating column now shows only the rating number
+
 ## v0.5.2
 
 ### Improvements

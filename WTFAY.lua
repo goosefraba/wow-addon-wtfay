@@ -1,9 +1,9 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.5.2
+-- WTFAY - Who The F* Are You?   v0.5.3
 -- Database, slash commands, browse UI, rating, notes
 ----------------------------------------------------------------------
 local ADDON_NAME = "WTFAY"
-local ADDON_VERSION = "0.5.2"
+local ADDON_VERSION = "0.5.3"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
@@ -868,10 +868,15 @@ local function CreateRow(index)
     row.noteText:SetJustifyH("LEFT")
     row.noteText:SetWordWrap(false)
 
-    -- Source badge
+    -- Source (line 2, after note)
     row.sourceText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.sourceText:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -8, 4)
-    row.sourceText:SetJustifyH("RIGHT")
+    row.sourceText:SetPoint("TOPLEFT", row, "TOPLEFT", 225, -18)
+    row.sourceText:SetJustifyH("LEFT")
+
+    -- Last Seen
+    row.seenText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    row.seenText:SetPoint("TOPLEFT", row, "TOPLEFT", 295, -18)
+    row.seenText:SetJustifyH("LEFT")
 
     row.playerKey = nil
     row:SetFrameLevel(content:GetFrameLevel() + 5)
@@ -1052,7 +1057,8 @@ RefreshList = function()
             end
 
             local _, srcDisplay = GetPlayerSources(p)
-            row.sourceText:SetText(srcDisplay .. " |cFF666666" .. (p.seen or "") .. "|r")
+            row.sourceText:SetText(srcDisplay)
+            row.seenText:SetText("|cFF666666" .. (p.seen or "") .. "|r")
 
             row.playerKey = key
 
