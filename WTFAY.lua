@@ -1,9 +1,9 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.5.3
+-- WTFAY - Who The F* Are You?   v0.6.0
 -- Database, slash commands, browse UI, rating, notes
 ----------------------------------------------------------------------
 local ADDON_NAME = "WTFAY"
-local ADDON_VERSION = "0.5.3"
+local ADDON_VERSION = "0.6.0"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
@@ -254,15 +254,50 @@ local sortedKeys = {}
 -- direction = "asc" | "desc"
 local sortField     = "seen"
 local sortDirection  = "desc"
+local groupFilterActive = false
+
+-- Returns a set of name-realm keys for all current group/raid members
+local function GetCurrentGroupKeys()
+    local keys = {}
+    if not IsInGroup() and not IsInRaid() then return keys end
+    local myName = UnitName("player") or ""
+    if IsInRaid() then
+        local n = GetNumRaidMembers and GetNumRaidMembers() or GetNumGroupMembers() or 0
+        for i = 1, n do
+            if UnitExists("raid" .. i) and UnitIsPlayer("raid" .. i) then
+                local name, realm = UnitName("raid" .. i)
+                if name and name ~= myName then
+                    realm = (realm and realm ~= "") and realm or (GetRealmName() or "Unknown")
+                    keys[name .. "-" .. realm] = true
+                end
+            end
+        end
+    else
+        local n = GetNumPartyMembers and GetNumPartyMembers() or (GetNumGroupMembers and GetNumGroupMembers() or 0)
+        for i = 1, n do
+            if UnitExists("party" .. i) and UnitIsPlayer("party" .. i) then
+                local name, realm = UnitName("party" .. i)
+                if name and name ~= myName then
+                    realm = (realm and realm ~= "") and realm or (GetRealmName() or "Unknown")
+                    keys[name .. "-" .. realm] = true
+                end
+            end
+        end
+    end
+    return keys
+end
 
 local function RebuildSorted(filterText, ratingMin, ratingMax, sourceFilter, classFilter)
     wipe(sortedKeys)
     filterText = (filterText or ""):lower()
     local classLower = classFilter and classFilter:lower() or nil
+    local groupKeys = groupFilterActive and GetCurrentGroupKeys() or nil
     for key, p in pairs(db.players) do
         local match = true
         -- Skip pending (inbox) players
         if p.pending then match = false end
+        -- Group filter: only show current group/raid members
+        if match and groupKeys and not groupKeys[key] then match = false end
         -- Text search: name only
         if match and filterText ~= "" and not p.name:lower():find(filterText, 1, true) then
             match = false
@@ -650,6 +685,34 @@ end)
 classFilterBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
 D("class filter button OK")
+
+----------------------------------------------------------------------
+-- Group filter toggle button
+----------------------------------------------------------------------
+local groupFilterBtn = CreateFrame("Button", nil, f)
+groupFilterBtn:SetSize(80, 22)
+groupFilterBtn:SetPoint("LEFT", classFilterBtn, "RIGHT", 2, 0)
+groupFilterBtn:SetNormalFontObject(GameFontNormalSmall)
+groupFilterBtn:SetHighlightFontObject(GameFontHighlightSmall)
+groupFilterBtn:SetText("|cFF888888My Group|r")
+
+local groupFilterBg = groupFilterBtn:CreateTexture(nil, "BACKGROUND")
+groupFilterBg:SetAllPoints()
+if groupFilterBg.SetColorTexture then
+    groupFilterBg:SetColorTexture(0.2, 0.2, 0.2, 0.6)
+else
+    groupFilterBg:SetTexture(0.2, 0.2, 0.2, 0.6)
+end
+
+groupFilterBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+    GameTooltip:AddLine("Group Filter", 0.67, 0.87, 1)
+    GameTooltip:AddLine("Show only players in your current group/raid", 0.7, 0.7, 0.7)
+    GameTooltip:Show()
+end)
+groupFilterBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+D("group filter button OK")
 
 ----------------------------------------------------------------------
 -- Player count label
@@ -1146,6 +1209,26 @@ classFilterBtn:SetScript("OnClick", function(self, button)
 end)
 classFilterBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 
+groupFilterBtn:SetScript("OnClick", function(self)
+    groupFilterActive = not groupFilterActive
+    if groupFilterActive then
+        self:SetText("|cFF00FF00My Group|r")
+        if groupFilterBg.SetColorTexture then
+            groupFilterBg:SetColorTexture(0.1, 0.3, 0.1, 0.8)
+        else
+            groupFilterBg:SetTexture(0.1, 0.3, 0.1, 0.8)
+        end
+    else
+        self:SetText("|cFF888888My Group|r")
+        if groupFilterBg.SetColorTexture then
+            groupFilterBg:SetColorTexture(0.2, 0.2, 0.2, 0.6)
+        else
+            groupFilterBg:SetTexture(0.2, 0.2, 0.2, 0.6)
+        end
+    end
+    RefreshList()
+end)
+
 f:SetScript("OnSizeChanged", function()
     RefreshList()
 end)
@@ -1171,7 +1254,7 @@ end)
 D("refresh list code OK")
 
 -- Register database-specific UI elements for tab switching
-dbElements = { searchBox, searchLabel, ratingFilterBtn, sourceFilterBtn, classFilterBtn, countLabel, headerBar, scrollParent, scrollFrame, content }
+dbElements = { searchBox, searchLabel, ratingFilterBtn, sourceFilterBtn, classFilterBtn, groupFilterBtn, countLabel, headerBar, scrollParent, scrollFrame, content }
 
 ----------------------------------------------------------------------
 -- Inbox tab content
@@ -1185,6 +1268,37 @@ do
     local inboxTitle = inboxContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     inboxTitle:SetPoint("TOPLEFT", inboxContent, "TOPLEFT", 4, -4)
     inboxTitle:SetText("|cFFAAAAAAPlayers to review — rate or dismiss:|r")
+
+    -- Purge All button
+    local purgeBtn = CreateFrame("Button", nil, inboxContent, "UIPanelButtonTemplate")
+    purgeBtn:SetSize(70, 20)
+    purgeBtn:SetPoint("TOPRIGHT", inboxContent, "TOPRIGHT", 0, -2)
+    purgeBtn:SetText("Purge All")
+    purgeBtn:SetScript("OnClick", function()
+        StaticPopup_Show("WTFAY_PURGE_INBOX")
+    end)
+
+    StaticPopupDialogs["WTFAY_PURGE_INBOX"] = {
+        text = "Remove all players from the inbox?",
+        button1 = "Yes",
+        button2 = "No",
+        OnAccept = function()
+            if not db or not db.players then return end
+            local count = 0
+            for key, p in pairs(db.players) do
+                if p.pending then
+                    db.players[key] = nil
+                    count = count + 1
+                end
+            end
+            P("Inbox purged: " .. count .. " player" .. (count == 1 and "" or "s") .. " removed.")
+            if RefreshInbox then RefreshInbox() end
+            UpdateInboxTabLabel()
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
 
     local INBOX_ROW_HEIGHT = 36
     local inboxScrollParent = CreateFrame("Frame", nil, inboxContent)
@@ -2993,7 +3107,8 @@ for idx, btn in ipairs(ratingButtons) do
             D("RatingPicker click: val=" .. self.ratingValue .. " key=" .. tostring(key))
             if not key or not db or not db.players[key] then return end
             db.players[key].rating = self.ratingValue
-            if db.players[key].pending then
+            local wasPending = db.players[key].pending
+            if wasPending then
                 db.players[key].pending = nil
                 P(db.players[key].name .. " rated " .. ColorRating(self.ratingValue) .. " |cFF44FF44(moved to database)|r")
             else
@@ -3003,6 +3118,11 @@ for idx, btn in ipairs(ratingButtons) do
             if RefreshInbox then RefreshInbox() end
             UpdateInboxTabLabel()
             ratingPicker:Hide()
+            -- Auto-open note editor for players coming from inbox
+            if wasPending then
+                popupActiveKey = key
+                StaticPopup_Show("WTFAY_EDIT_NOTE", db.players[key].name)
+            end
         end)
         if not ok then D("RatingPicker ERROR: " .. tostring(err)) end
     end)

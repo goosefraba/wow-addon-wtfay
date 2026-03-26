@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.0
+
+### New Features
+- **Group/Raid Filter** — New "My Group" toggle button in the filter bar shows only players currently in your group or raid, with their rating and notes
+- **Inbox Purge All** — Clear the entire inbox at once with a confirmation dialog
+- **Rate + Note in One Step** — Rating an inbox player now automatically opens the note editor, so you can rate and annotate in a single flow
+
 ## v0.5.3
 
 ### Bug Fixes
