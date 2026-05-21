@@ -1,9 +1,9 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.6.0
+-- WTFAY - Who The F* Are You?   v0.6.1
 -- Database, slash commands, browse UI, rating, notes
 ----------------------------------------------------------------------
 local ADDON_NAME = "WTFAY"
-local ADDON_VERSION = "0.6.0"
+local ADDON_VERSION = "0.6.1"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
@@ -1333,10 +1333,12 @@ do
     end
 
     local function CreateInboxRow(index)
-        local row = CreateFrame("Frame", nil, inboxContentFrame)
+        local row = CreateFrame("Button", nil, inboxContentFrame)
         row:SetHeight(INBOX_ROW_HEIGHT)
         row:SetPoint("TOPLEFT", inboxContentFrame, "TOPLEFT", 0, -((index - 1) * INBOX_ROW_HEIGHT))
         row:SetPoint("RIGHT", inboxContentFrame, "RIGHT", 0, 0)
+        row:EnableMouse(true)
+        row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 
         if BackdropTemplateMixin then Mixin(row, BackdropTemplateMixin); row:OnBackdropLoaded() end
         if row.SetBackdrop then
@@ -1346,6 +1348,36 @@ do
             })
             row:SetBackdropColor(0.1, 0.1, 0.13, 0.8)
         end
+
+        -- Store base color for hover restore; updated per-row in RefreshInbox
+        row.baseR, row.baseG, row.baseB, row.baseA = 0.1, 0.1, 0.13, 0.8
+
+        -- Hover highlight (matches database rows)
+        row:SetScript("OnEnter", function(self)
+            if self.SetBackdropColor then
+                self:SetBackdropColor(
+                    math.min(self.baseR + 0.12, 1),
+                    math.min(self.baseG + 0.15, 1),
+                    math.min(self.baseB + 0.20, 1),
+                    0.9
+                )
+            end
+        end)
+        row:SetScript("OnLeave", function(self)
+            if self.SetBackdropColor then
+                self:SetBackdropColor(self.baseR, self.baseG, self.baseB, self.baseA)
+            end
+        end)
+
+        -- Left-click = detail panel, Right-click = context menu (same as database rows)
+        row:SetScript("OnClick", function(self, button)
+            if not self.playerKey then return end
+            if button == "RightButton" then
+                RowMenu(self)
+            elseif button == "LeftButton" then
+                ShowDetailPanel(self.playerKey)
+            end
+        end)
 
         row.nameText = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         row.nameText:SetPoint("TOPLEFT", row, "TOPLEFT", 6, -4)
@@ -1416,13 +1448,14 @@ do
                     if p.seen then parts[#parts + 1] = "|cFF666666" .. p.seen .. "|r" end
                     row.infoText:SetText("|cFFAAAAAA" .. table.concat(parts, "  ") .. "|r")
                     row.playerKey = key
-                    -- Alternate row colors
+                    -- Alternate row colors + store base for hover restore
                     if row.SetBackdropColor then
                         if i % 2 == 0 then
-                            row:SetBackdropColor(0.12, 0.12, 0.15, 0.8)
+                            row.baseR, row.baseG, row.baseB, row.baseA = 0.12, 0.12, 0.15, 0.8
                         else
-                            row:SetBackdropColor(0.08, 0.08, 0.10, 0.8)
+                            row.baseR, row.baseG, row.baseB, row.baseA = 0.08, 0.08, 0.10, 0.8
                         end
+                        row:SetBackdropColor(row.baseR, row.baseG, row.baseB, row.baseA)
                     end
                     row:Show()
                 else
