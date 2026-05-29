@@ -1,9 +1,9 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.6.1
+-- WTFAY - Who The F* Are You?   v0.7.0
 -- Database, slash commands, browse UI, rating, notes
 ----------------------------------------------------------------------
 local ADDON_NAME = "WTFAY"
-local ADDON_VERSION = "0.6.1"
+local ADDON_VERSION = "0.7.0"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
@@ -462,6 +462,83 @@ closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
 D("title + close OK")
 
 ----------------------------------------------------------------------
+-- Pill button factory — flat dark button with an active state, used for
+-- segmented toggles (main tabs, source filter, group filter). Active state
+-- uses WTFAY's cyan accent so it matches the rest of the addon. Auto-sizes
+-- to its label; callers may override with SetWidth() / FitLabel().
+----------------------------------------------------------------------
+local PILL_BG_INACTIVE  = { 0.10, 0.10, 0.12, 0.85 }
+local PILL_BG_ACTIVE    = { 0.10, 0.45, 0.62, 0.95 }  -- WTFAY cyan
+local PILL_BG_HOVER     = { 0.14, 0.20, 0.24, 0.95 }
+local PILL_TXT_INACTIVE = { 0.62, 0.66, 0.68 }
+local PILL_TXT_ACTIVE   = { 0.85, 0.97, 1.00 }
+local PILL_TXT_HOVER    = { 0.80, 0.90, 0.94 }
+
+local function MakePill(parent, label)
+    local b = CreateFrame("Button", nil, parent)
+    b:SetHeight(20)
+    b:EnableMouse(true)
+    b:RegisterForClicks("LeftButtonUp")
+
+    if BackdropTemplateMixin then
+        Mixin(b, BackdropTemplateMixin)
+        b:OnBackdropLoaded()
+    end
+    if b.SetBackdrop then
+        b:SetBackdrop({
+            bgFile   = "Interface\\Buttons\\WHITE8x8",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 8, edgeSize = 10,
+            insets = { left = 3, right = 3, top = 3, bottom = 3 },
+        })
+        b:SetBackdropColor(unpack(PILL_BG_INACTIVE))
+    end
+
+    local fs = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    fs:SetPoint("CENTER")
+    fs:SetText(label or "")
+    fs:SetTextColor(unpack(PILL_TXT_INACTIVE))
+    b.text = fs
+    b:SetWidth(math.max(40, fs:GetStringWidth() + 20))
+
+    function b:SetActive(active)
+        self._active = active and true or false
+        if not self.SetBackdropColor then return end
+        if active then
+            self:SetBackdropColor(unpack(PILL_BG_ACTIVE))
+            self.text:SetTextColor(unpack(PILL_TXT_ACTIVE))
+        else
+            self:SetBackdropColor(unpack(PILL_BG_INACTIVE))
+            self.text:SetTextColor(unpack(PILL_TXT_INACTIVE))
+        end
+    end
+    function b:IsActive() return self._active end
+
+    -- Resize to fit the current label (call after the text changes)
+    function b:FitLabel(minW)
+        self:SetWidth(math.max(minW or 40, self.text:GetStringWidth() + 20))
+    end
+
+    b:SetScript("OnEnter", function(self)
+        if not self._active and self.SetBackdropColor then
+            self:SetBackdropColor(unpack(PILL_BG_HOVER))
+            self.text:SetTextColor(unpack(PILL_TXT_HOVER))
+        end
+    end)
+    b:SetScript("OnLeave", function(self)
+        if not self._active and self.SetBackdropColor then
+            self:SetBackdropColor(unpack(PILL_BG_INACTIVE))
+            self.text:SetTextColor(unpack(PILL_TXT_INACTIVE))
+        end
+    end)
+
+    b:SetActive(false)
+    return b
+end
+
+D("pill factory OK")
+
+----------------------------------------------------------------------
 -- Main window tabs: Database / Inbox
 ----------------------------------------------------------------------
 local mainTabButtons = {}
@@ -479,13 +556,15 @@ local function GetInboxCount()
 end
 
 local function UpdateInboxTabLabel()
-    if mainTabButtons["Inbox"] then
+    local btn = mainTabButtons["Inbox"]
+    if btn then
         local count = GetInboxCount()
         if count > 0 then
-            mainTabButtons["Inbox"].label:SetText("Inbox (|cFFFF8800" .. count .. "|r)")
+            btn.text:SetText("Inbox (|cFFFF8800" .. count .. "|r)")
         else
-            mainTabButtons["Inbox"].label:SetText("Inbox")
+            btn.text:SetText("Inbox")
         end
+        btn:FitLabel(60)
     end
 end
 
@@ -493,13 +572,7 @@ local activeMainTab = "Database"
 local function ShowMainTab(name)
     activeMainTab = name
     for tname, btn in pairs(mainTabButtons) do
-        if tname == name then
-            btn.label:SetTextColor(1, 0.82, 0.1)
-            btn.underline:Show()
-        else
-            btn.label:SetTextColor(0.6, 0.6, 0.6)
-            btn.underline:Hide()
-        end
+        btn:SetActive(tname == name)
     end
     -- Show/hide database elements
     local showDb = (name == "Database")
@@ -519,26 +592,18 @@ end
 
 do
     local MAIN_TAB_NAMES = { "Database", "Inbox" }
-    local tabW = 80
-    local totalW = tabW * #MAIN_TAB_NAMES
-    local sx = (MIN_W - totalW) / 2  -- will be re-centered on resize but good enough
-    for i, tname in ipairs(MAIN_TAB_NAMES) do
-        local btn = CreateFrame("Button", nil, f)
-        btn:SetSize(tabW, 18)
-        btn:SetPoint("TOPLEFT", f, "TOPLEFT", 60 + (i - 1) * (tabW + 8), -34)
-        local lbl = btn:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        lbl:SetPoint("CENTER", btn, "CENTER", 0, 0)
-        lbl:SetText(tname)
-        btn.label = lbl
-        local ul = btn:CreateTexture(nil, "ARTWORK")
-        ul:SetHeight(2)
-        ul:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", 4, 0)
-        ul:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -4, 0)
-        if ul.SetColorTexture then ul:SetColorTexture(0.9, 0.7, 0.2, 1) else ul:SetTexture(0.9, 0.7, 0.2, 1) end
-        ul:Hide()
-        btn.underline = ul
+    local prev
+    for _, tname in ipairs(MAIN_TAB_NAMES) do
+        local btn = MakePill(f, tname)
+        btn:FitLabel(70)
+        if prev then
+            btn:SetPoint("LEFT", prev, "RIGHT", 6, 0)
+        else
+            btn:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -34)
+        end
         btn:SetScript("OnClick", function() ShowMainTab(tname) end)
         mainTabButtons[tname] = btn
+        prev = btn
     end
 end
 
@@ -589,9 +654,9 @@ ratingFilterBtn:SetText("|cFFFFD100" .. ratingFilterPresets[1].label .. "|r")
 local ratingFilterBg = ratingFilterBtn:CreateTexture(nil, "BACKGROUND")
 ratingFilterBg:SetAllPoints()
 if ratingFilterBg.SetColorTexture then
-    ratingFilterBg:SetColorTexture(0.2, 0.2, 0.2, 0.6)
+    ratingFilterBg:SetColorTexture(0.10, 0.10, 0.12, 0.85)
 else
-    ratingFilterBg:SetTexture(0.2, 0.2, 0.2, 0.6)
+    ratingFilterBg:SetTexture(0.10, 0.10, 0.12, 0.85)
 end
 
 ratingFilterBtn:SetScript("OnEnter", function(self)
@@ -609,7 +674,7 @@ D("rating filter button OK")
 -- Source filter button (cycles through presets)
 ----------------------------------------------------------------------
 local sourceFilterPresets = {
-    { label = "All Sources", value = nil   },
+    { label = "All",         value = nil   },
     { label = "Raid",        value = "raid"    },
     { label = "Dungeon",     value = "dungeon" },
     { label = "Group",       value = "group"   },
@@ -617,31 +682,32 @@ local sourceFilterPresets = {
 }
 local currentSourceFilterIdx = 1
 
-local sourceFilterBtn = CreateFrame("Button", nil, f)
-sourceFilterBtn:SetSize(80, 22)
-sourceFilterBtn:SetPoint("LEFT", ratingFilterBtn, "RIGHT", 2, 0)
-sourceFilterBtn:SetNormalFontObject(GameFontNormalSmall)
-sourceFilterBtn:SetHighlightFontObject(GameFontHighlightSmall)
-sourceFilterBtn:SetText("|cFFAADDFF" .. sourceFilterPresets[1].label .. "|r")
-
-local sourceFilterBg = sourceFilterBtn:CreateTexture(nil, "BACKGROUND")
-sourceFilterBg:SetAllPoints()
-if sourceFilterBg.SetColorTexture then
-    sourceFilterBg:SetColorTexture(0.2, 0.2, 0.2, 0.6)
-else
-    sourceFilterBg:SetTexture(0.2, 0.2, 0.2, 0.6)
+-- Source filter — segmented pill row (one pill per source), on the second
+-- filter row. Click a pill to select; OnClick handlers are wired later, once
+-- RefreshList exists. UpdateSourcePills() reflects the current selection.
+local sourcePills = {}
+local function UpdateSourcePills()
+    for i, b in ipairs(sourcePills) do
+        b:SetActive(i == currentSourceFilterIdx)
+    end
 end
 
-sourceFilterBtn:SetScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
-    GameTooltip:AddLine("Source Filter", 0.67, 0.87, 1)
-    GameTooltip:AddLine("Left-click to cycle forward", 0.7, 0.7, 0.7)
-    GameTooltip:AddLine("Right-click to cycle back", 0.7, 0.7, 0.7)
-    GameTooltip:Show()
-end)
-sourceFilterBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+do
+    local prev
+    for i, preset in ipairs(sourceFilterPresets) do
+        local b = MakePill(f, preset.label)
+        if prev then
+            b:SetPoint("LEFT", prev, "RIGHT", 4, 0)
+        else
+            b:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -84)
+        end
+        sourcePills[i] = b
+        prev = b
+    end
+    UpdateSourcePills()
+end
 
-D("source filter button OK")
+D("source filter pills OK")
 
 ----------------------------------------------------------------------
 -- Class filter button (cycles through classes)
@@ -662,7 +728,7 @@ local currentClassFilterIdx = 1
 
 local classFilterBtn = CreateFrame("Button", nil, f)
 classFilterBtn:SetSize(80, 22)
-classFilterBtn:SetPoint("LEFT", sourceFilterBtn, "RIGHT", 2, 0)
+classFilterBtn:SetPoint("LEFT", ratingFilterBtn, "RIGHT", 4, 0)
 classFilterBtn:SetNormalFontObject(GameFontNormalSmall)
 classFilterBtn:SetHighlightFontObject(GameFontHighlightSmall)
 classFilterBtn:SetText("|cFF" .. classFilterPresets[1].color .. classFilterPresets[1].label .. "|r")
@@ -670,9 +736,9 @@ classFilterBtn:SetText("|cFF" .. classFilterPresets[1].color .. classFilterPrese
 local classFilterBg = classFilterBtn:CreateTexture(nil, "BACKGROUND")
 classFilterBg:SetAllPoints()
 if classFilterBg.SetColorTexture then
-    classFilterBg:SetColorTexture(0.2, 0.2, 0.2, 0.6)
+    classFilterBg:SetColorTexture(0.10, 0.10, 0.12, 0.85)
 else
-    classFilterBg:SetTexture(0.2, 0.2, 0.2, 0.6)
+    classFilterBg:SetTexture(0.10, 0.10, 0.12, 0.85)
 end
 
 classFilterBtn:SetScript("OnEnter", function(self)
@@ -687,32 +753,22 @@ classFilterBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 D("class filter button OK")
 
 ----------------------------------------------------------------------
--- Group filter toggle button
+-- Group filter — single toggle pill (right-aligned on the second filter row)
 ----------------------------------------------------------------------
-local groupFilterBtn = CreateFrame("Button", nil, f)
-groupFilterBtn:SetSize(80, 22)
-groupFilterBtn:SetPoint("LEFT", classFilterBtn, "RIGHT", 2, 0)
-groupFilterBtn:SetNormalFontObject(GameFontNormalSmall)
-groupFilterBtn:SetHighlightFontObject(GameFontHighlightSmall)
-groupFilterBtn:SetText("|cFF888888My Group|r")
+local groupFilterPill = MakePill(f, "My Group")
+groupFilterPill:FitLabel(70)
+groupFilterPill:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -84)
 
-local groupFilterBg = groupFilterBtn:CreateTexture(nil, "BACKGROUND")
-groupFilterBg:SetAllPoints()
-if groupFilterBg.SetColorTexture then
-    groupFilterBg:SetColorTexture(0.2, 0.2, 0.2, 0.6)
-else
-    groupFilterBg:SetTexture(0.2, 0.2, 0.2, 0.6)
-end
-
-groupFilterBtn:SetScript("OnEnter", function(self)
+-- HookScript so the pill's built-in hover styling still fires alongside the tooltip
+groupFilterPill:HookScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
     GameTooltip:AddLine("Group Filter", 0.67, 0.87, 1)
     GameTooltip:AddLine("Show only players in your current group/raid", 0.7, 0.7, 0.7)
     GameTooltip:Show()
 end)
-groupFilterBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+groupFilterPill:HookScript("OnLeave", function() GameTooltip:Hide() end)
 
-D("group filter button OK")
+D("group filter pill OK")
 
 ----------------------------------------------------------------------
 -- Player count label
@@ -728,7 +784,7 @@ D("count label OK")
 ----------------------------------------------------------------------
 local HEADER_HEIGHT = 20
 local headerBar = CreateFrame("Frame", nil, f)
-headerBar:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -82)
+headerBar:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -108)
 headerBar:SetPoint("RIGHT", f, "RIGHT", -30, 0)
 headerBar:SetHeight(HEADER_HEIGHT)
 
@@ -1182,18 +1238,14 @@ ratingFilterBtn:SetScript("OnClick", function(self, button)
 end)
 ratingFilterBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 
-sourceFilterBtn:SetScript("OnClick", function(self, button)
-    if button == "RightButton" then
-        currentSourceFilterIdx = currentSourceFilterIdx - 1
-        if currentSourceFilterIdx < 1 then currentSourceFilterIdx = #sourceFilterPresets end
-    else
-        currentSourceFilterIdx = currentSourceFilterIdx + 1
-        if currentSourceFilterIdx > #sourceFilterPresets then currentSourceFilterIdx = 1 end
-    end
-    self:SetText("|cFFAADDFF" .. sourceFilterPresets[currentSourceFilterIdx].label .. "|r")
-    RefreshList()
-end)
-sourceFilterBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+-- Wire source pill clicks now that RefreshList exists
+for i, b in ipairs(sourcePills) do
+    b:SetScript("OnClick", function()
+        currentSourceFilterIdx = i
+        UpdateSourcePills()
+        RefreshList()
+    end)
+end
 
 classFilterBtn:SetScript("OnClick", function(self, button)
     if button == "RightButton" then
@@ -1209,23 +1261,9 @@ classFilterBtn:SetScript("OnClick", function(self, button)
 end)
 classFilterBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 
-groupFilterBtn:SetScript("OnClick", function(self)
+groupFilterPill:SetScript("OnClick", function(self)
     groupFilterActive = not groupFilterActive
-    if groupFilterActive then
-        self:SetText("|cFF00FF00My Group|r")
-        if groupFilterBg.SetColorTexture then
-            groupFilterBg:SetColorTexture(0.1, 0.3, 0.1, 0.8)
-        else
-            groupFilterBg:SetTexture(0.1, 0.3, 0.1, 0.8)
-        end
-    else
-        self:SetText("|cFF888888My Group|r")
-        if groupFilterBg.SetColorTexture then
-            groupFilterBg:SetColorTexture(0.2, 0.2, 0.2, 0.6)
-        else
-            groupFilterBg:SetTexture(0.2, 0.2, 0.2, 0.6)
-        end
-    end
+    self:SetActive(groupFilterActive)
     RefreshList()
 end)
 
@@ -1254,7 +1292,10 @@ end)
 D("refresh list code OK")
 
 -- Register database-specific UI elements for tab switching
-dbElements = { searchBox, searchLabel, ratingFilterBtn, sourceFilterBtn, classFilterBtn, groupFilterBtn, countLabel, headerBar, scrollParent, scrollFrame, content }
+dbElements = { searchBox, searchLabel, ratingFilterBtn, classFilterBtn, groupFilterPill, countLabel, headerBar, scrollParent, scrollFrame, content }
+for _, b in ipairs(sourcePills) do
+    dbElements[#dbElements + 1] = b
+end
 
 ----------------------------------------------------------------------
 -- Inbox tab content

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.0
+
+### UI
+- **Redesigned filter bar with pill buttons** — segmented, click-to-select controls with a modern dark/cyan look, replacing the old cycle-through buttons
+- **Database / Inbox tabs** are now pills
+- **Source filter** is now a row of pills (All · Raid · Dungeon · Group · Manual) — click a source directly instead of cycling through them
+- **"My Group" filter** is now a single toggle pill
+- Rating and Class filters restyled to match the new palette
+
 ## v0.6.0
 
 ### New Features
