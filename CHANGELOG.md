@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.7.1
+
+### Compatibility
+- Updated for TBC Classic 2.5.6 (Interface 20506)
+
 ## v0.7.0
 
 ### UI
