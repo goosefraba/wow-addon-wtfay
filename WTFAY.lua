@@ -1,15 +1,22 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.7.1
+-- WTFAY - Who The F* Are You?   v0.8.0
 -- Database, slash commands, browse UI, rating, notes
+--
+-- Multi-flavor: TBC Anniversary (20506), WoW Forever (16001) and Midnight
+-- (120100+). Everything client-specific lives in Compat.lua and is reached
+-- through ns.C - do NOT branch on game flavor in this file.
 ----------------------------------------------------------------------
-local ADDON_NAME = "WTFAY"
-local ADDON_VERSION = "0.7.1"
+local ADDON_NAME, ns = ...
+local C = ns.C
+local T = C.T   -- text colour tokens; never write a raw |cFF literal
+
+local ADDON_VERSION = "0.8.0"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
 
 local function P(msg) print(PREFIX .. msg) end
-local function D(msg) if DEBUG then print("|cFF999999[WTFAY-DBG]|r " .. tostring(msg)) end end
+local function D(msg) if DEBUG then print(T.grey .. "[WTFAY-DBG]|r " .. tostring(msg)) end end
 
 D(">>> File loading started")
 
@@ -28,6 +35,9 @@ local function ColorRating(r)
     end
 end
 
+-- Filterable classes for the class-filter pill (also the color fallback
+-- source for that list). Actual coloring goes through the compat layer,
+-- which prefers Blizzard's RAID_CLASS_COLORS on every flavor.
 local CLASS_COLORS = {
     WARRIOR     = "C79C6E", PALADIN   = "F58CBA", HUNTER    = "ABD473",
     ROGUE       = "FFF569", PRIEST    = "FFFFFF", SHAMAN    = "0070DE",
@@ -35,13 +45,30 @@ local CLASS_COLORS = {
 }
 
 local function ClassColor(class)
-    local c = CLASS_COLORS[(class or ""):upper()] or "AAAAAA"
-    return "|cFF" .. c
+    return "|cFF" .. C.ClassColorHex(class)
 end
 
 local function Timestamp()
     return date("%Y-%m-%d %H:%M")
 end
+
+----------------------------------------------------------------------
+-- Name / realm identity
+--
+-- All of this is flavor-dependent and lives in Compat.lua:
+--   * Classic keys a player "Name-Realm". Realms are normalized (spaces and
+--     dashes stripped) and input is split on the FIRST dash, so
+--     "Bob-Azjol-Nerub" becomes Bob / AzjolNerub rather than Bob-Azjol / Nerub.
+--   * Forever has NO realm suffix. Characters have surnames, so the whole
+--     "Firstname Surname" string is the identity - never split it on a dash
+--     and never strip its spaces.
+-- Always build keys with MakeKey so the rule stays in exactly one place.
+----------------------------------------------------------------------
+local TitleCase      = C.TitleCase
+local NormalizeRealm = C.NormalizeRealm
+local MakeKey        = C.MakeKey
+local SplitNameRealm = C.SplitInput
+local UnitKey        = C.UnitKey
 
 local SOURCE_INFO = {
     raid    = { color = "FF6699", label = "Raid" },
@@ -121,6 +148,12 @@ local SETTINGS_DEFAULTS = {
     alertSound       = true,   -- Play a sound when the alert popup appears
     alertSoundChoice = 1,      -- Index into ALERT_SOUNDS (default: Quest Complete)
     alertSkipGuild   = true,   -- Skip guild members from known player alerts
+    tooltipEnabled   = true,   -- Show WTFAY info on player tooltips
+    tooltipHint      = false,  -- Show "/wtfay target to track" on unknown players
+    tooltipGuild     = true,   -- Show the guild name in the tooltip when known
+    whoEnrich        = true,   -- Fill in missing class/level/guild via /who lookups
+    unitMenu         = true,   -- Add a WTFAY entry to right-click unit menus
+    skin             = "auto", -- "auto" (native on Mainline), "native" or "dark"
 }
 
 -- Play the user's chosen alert sound (isBlacklist = true for blacklisted warning)
@@ -147,6 +180,42 @@ local function InitDB()
         if db.settings[k] == nil then db.settings[k] = v end
     end
 
+    -- Migration: rekey players stored before realm normalization existed, so
+    -- "Bob-Azjol Nerub" / "Bob-Azjol-Nerub" both become "Bob-AzjolNerub".
+    local DB_VERSION = 2
+    if (db.dbVersion or 1) < DB_VERSION then
+        local function Richness(x)
+            return (((x.rating or 0) ~= 0) and 2 or 0) + (((x.note or "") ~= "") and 1 or 0)
+        end
+        local rekeyed, moved = {}, 0
+        for oldKey, p in pairs(db.players) do
+            -- Recover name/realm from the old key if the record is incomplete,
+            -- and store back exactly what the new key is built from.
+            local nm = p.name
+            if not nm or nm == "" then nm = oldKey:match("^([^%-]+)") or oldKey end
+            local rlm = NormalizeRealm(p.realm)
+            if rlm == "" then rlm = NormalizeRealm(oldKey:match("^[^%-]+%-(.+)$")) end
+            if rlm == "" then rlm = C.MyRealm() end
+            -- Only invent a placeholder realm on flavors that have realms;
+            -- on Forever the empty string is the correct value.
+            if rlm == "" and C.UsesRealms then rlm = "Unknown" end
+            p.name, p.realm = nm, rlm
+
+            local newKey = MakeKey(nm, rlm)
+            if newKey ~= oldKey then moved = moved + 1 end
+            local existing = rekeyed[newKey]
+            -- Two old keys can collapse onto one; keep the richer record.
+            if existing and Richness(existing) >= Richness(p) then
+                rekeyed[newKey] = existing
+            else
+                rekeyed[newKey] = p
+            end
+        end
+        db.players = rekeyed
+        db.dbVersion = DB_VERSION
+        if moved > 0 then D("DB migration: rekeyed " .. moved .. " player(s)") end
+    end
+
     -- Seed sample data on first install so the addon isn't empty
     local SEED_VERSION = 4
     if (db.seedVersion or 0) < SEED_VERSION then
@@ -165,7 +234,7 @@ local function InitDB()
             Zugzug      = { "manual" },
         }
         for _, p in ipairs(SEED_PLAYERS) do
-            local key = p.name .. "-" .. p.realm
+            local key = MakeKey(p.name, p.realm)
             local encounters = {}
             local srcList = fakeEncounters[p.name] or { p.source }
             for idx, src in ipairs(srcList) do
@@ -177,7 +246,8 @@ local function InitDB()
             end
             db.players[key] = {
                 name       = p.name,
-                realm      = p.realm,
+                -- Forever has no realms; don't store one the key doesn't use.
+                realm      = C.UsesRealms and p.realm or "",
                 class      = p.class,
                 race       = p.race or "",
                 level      = p.level,
@@ -202,45 +272,99 @@ end
 
 -- Log an encounter for a player (appends to encounters list)
 -- zone is optional: e.g. "Karazhan", "Shattered Halls"
-local function LogEncounter(key, source, zone)
-    if not db or not db.players[key] then return end
-    if not db.players[key].encounters then
-        db.players[key].encounters = {}
+local LogEncounter
+do
+    -- Where the player is right now: zone, subzone, and whether it's an instance.
+    local function CurrentLocation()
+        local inInstance = IsInInstance and IsInInstance()
+        local zone
+        if inInstance and GetInstanceInfo then zone = GetInstanceInfo() end
+        if not zone or zone == "" then zone = GetRealZoneText and GetRealZoneText() or "" end
+        local sub = GetSubZoneText and GetSubZoneText() or ""
+        if sub == zone then sub = "" end
+        return zone, sub, inInstance and true or false
     end
-    local enc = db.players[key].encounters
 
-    -- Dedup logic:
-    -- Instanced content (dungeon/raid with a zone): skip if same source + same zone
-    --   → wipes, corpse runs, reloads won't create duplicates
-    --   → running a different dungeon creates a new encounter
-    -- Non-instanced (group/manual, no zone): skip if same source within 30 minutes
-    --   → regrouping after a break creates a new encounter
-    local now = time()
-    local effectiveSource = source or db.players[key].source or "manual"
-    local effectiveZone = (zone and zone ~= "") and zone or nil
-    if #enc > 0 then
-        local last = enc[#enc]
-        if last.source == effectiveSource then
-            if effectiveZone and effectiveZone == (last.zone or nil) then
-                -- Same instance — skip (covers wipes, corpse runs)
-                return
-            elseif not effectiveZone and not last.zone and last._ts and (now - last._ts) < 1800 then
-                -- Same non-instanced source within 30 min — skip
-                return
+    -- A level, or nil when unknown: 0 / -1 ("??") or a Midnight-era secret value.
+    local function SafeLevel(v)
+        if v == nil or C.IsSecret(v) then return nil end
+        v = tonumber(v)
+        if not v or v <= 0 then return nil end
+        return v
+    end
+
+    -- Log an encounter for a player (appended; displayed newest-first).
+    --   zone       instance name the caller already knows (else read here)
+    --   theirLevel their level right now, when there was a unit to read it from
+    --   remote     true when they were added by name and weren't actually with
+    --              you, so where you happened to be says nothing about them
+    LogEncounter = function(key, source, zone, theirLevel, remote)
+        local p = db and db.players[key]
+        if not p then return end
+        if not p.encounters then p.encounters = {} end
+        local enc = p.encounters
+
+        local now = time()
+        local effectiveSource = source or p.source or "manual"
+        local where, sub, instanced = nil, nil, false
+        if not remote then
+            local z, sz, inst = CurrentLocation()
+            where = (zone and zone ~= "") and zone or z
+            sub, instanced = sz, inst
+        end
+        if where == "" then where = nil end
+        if sub == "" then sub = nil end
+
+        -- Dedup:
+        --   Instanced: skip when the last encounter was the same source in the
+        --   same instance (wipes, corpse runs, reloads).
+        --   Open world: skip the same source within 30 minutes in the same zone,
+        --   so regrouping after a break, or meeting again somewhere new, counts.
+        --   Entries from before locations were recorded only carried a zone when
+        --   instanced, so on an old entry (no `instance` field) a zone still
+        --   means "instance" -- which is why new entries always set the field.
+        if #enc > 0 then
+            local last = enc[#enc]
+            local lastInstanced = last.instance or (last.instance == nil and last.zone ~= nil)
+            if last.source == effectiveSource then
+                if instanced then
+                    if lastInstanced and last.zone == where then return end
+                elseif not lastInstanced and last._ts and (now - last._ts) < 1800
+                       and (last.zone == nil or last.zone == where) then
+                    return
+                end
             end
         end
-    end
 
-    -- Append newest at the end (we'll display newest-first)
-    local entry = {
-        time   = Timestamp(),
-        source = effectiveSource,
-        _ts    = now,
-    }
-    if effectiveZone then
-        entry.zone = effectiveZone
+        enc[#enc + 1] = {
+            time     = Timestamp(),
+            source   = effectiveSource,
+            _ts      = now,
+            zone     = where,
+            subzone  = sub,
+            instance = instanced,
+            remote   = remote and true or nil,
+            lvl      = SafeLevel(theirLevel),
+            myLvl    = SafeLevel(UnitLevel and UnitLevel("player")),
+        }
     end
-    enc[#enc + 1] = entry
+end
+
+-- Where you first met someone, from the first encounter you were actually with
+-- them (not an add-by-name): "Met in Elwynn Forest at level 12 (you 11)".
+-- Plain text without colour codes, or nil when no encounter has a location.
+local function MetLineFor(p)
+    for _, e in ipairs(p and p.encounters or {}) do
+        if e.zone and not e.remote then
+            local text = "Met in " .. e.zone
+            if e.lvl then text = text .. " at level " .. e.lvl end
+            if e.myLvl then
+                text = text .. (e.lvl and (" (you " .. e.myLvl .. ")") or (" (you were " .. e.myLvl .. ")"))
+            end
+            return text
+        end
+    end
+    return nil
 end
 
 D("database code OK")
@@ -260,29 +384,21 @@ local groupFilterActive = false
 local function GetCurrentGroupKeys()
     local keys = {}
     if not IsInGroup() and not IsInRaid() then return keys end
-    local myName = UnitName("player") or ""
+    local myName = C.UnitIdentity("player") or ""
+
+    local prefix, n
     if IsInRaid() then
-        local n = GetNumRaidMembers and GetNumRaidMembers() or GetNumGroupMembers() or 0
-        for i = 1, n do
-            if UnitExists("raid" .. i) and UnitIsPlayer("raid" .. i) then
-                local name, realm = UnitName("raid" .. i)
-                if name and name ~= myName then
-                    realm = (realm and realm ~= "") and realm or (GetRealmName() or "Unknown")
-                    keys[name .. "-" .. realm] = true
-                end
-            end
-        end
+        prefix = "raid"
+        n = GetNumRaidMembers and GetNumRaidMembers() or GetNumGroupMembers() or 0
     else
-        local n = GetNumPartyMembers and GetNumPartyMembers() or (GetNumGroupMembers and GetNumGroupMembers() or 0)
-        for i = 1, n do
-            if UnitExists("party" .. i) and UnitIsPlayer("party" .. i) then
-                local name, realm = UnitName("party" .. i)
-                if name and name ~= myName then
-                    realm = (realm and realm ~= "") and realm or (GetRealmName() or "Unknown")
-                    keys[name .. "-" .. realm] = true
-                end
-            end
-        end
+        prefix = "party"
+        n = GetNumPartyMembers and GetNumPartyMembers() or (GetNumGroupMembers and GetNumGroupMembers() or 0)
+    end
+
+    -- Must go through UnitKey so these match the normalized db.players keys.
+    for i = 1, n do
+        local key, name = UnitKey(prefix .. i)
+        if key and name ~= myName then keys[key] = true end
     end
     return keys
 end
@@ -355,12 +471,16 @@ D("sorted list code OK")
 ----------------------------------------------------------------------
 -- Main frame — no template, pure API
 ----------------------------------------------------------------------
-local MIN_W, MIN_H = 440, 320
-local MAX_W, MAX_H = 800, 700
+-- MIN_W has to fit the fixed columns (360px) plus a readable Name column.
+-- MAX_W was 800, which the resizable list comfortably outgrows.
+local MIN_W, MIN_H = 640, 320
+local MAX_W, MAX_H = 1200, 700
 
 D("creating main frame...")
-local f = CreateFrame("Frame", "WTFAYFrame", UIParent)
-D("main frame created (no template)")
+-- On Mainline this is a ButtonFrameTemplate, so the native skin can show the
+-- client's own window chrome; the dark skin hides that art again.
+local f = C.CreateWindow("WTFAYFrame", UIParent)
+D("main frame created (template: " .. tostring(f.wtfayIsTemplate and true or false) .. ")")
 
 f:SetSize(MIN_W, MIN_H)
 f:SetPoint("CENTER")
@@ -381,16 +501,8 @@ else
     D("WARNING: No backdrop support found!")
 end
 
-if f.SetBackdrop then
-    f:SetBackdrop({
-        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-        tile = true, tileSize = 32, edgeSize = 32,
-        insets = { left = 8, right = 8, top = 8, bottom = 8 },
-    })
-    f:SetBackdropColor(0, 0, 0, 0.92)
-    D("backdrop set OK")
-end
+-- Chrome is applied by C.SkinWindow once the title and close button exist.
+D("backdrop deferred to SkinWindow")
 
 f:Hide()
 
@@ -458,6 +570,7 @@ titleBar:SetText("|cFF" .. ACCENT .. "WTFAY|r - Who The F* Are You?")
 -- Close button
 local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
 closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+C.SkinWindow(f, { title = titleBar, close = closeBtn, edgeSize = 32, insets = { left = 8, right = 8, top = 8, bottom = 8 } })
 
 D("title + close OK")
 
@@ -467,12 +580,19 @@ D("title + close OK")
 -- uses WTFAY's cyan accent so it matches the rest of the addon. Auto-sizes
 -- to its label; callers may override with SetWidth() / FitLabel().
 ----------------------------------------------------------------------
-local PILL_BG_INACTIVE  = { 0.10, 0.10, 0.12, 0.85 }
+local PILL_BG_INACTIVE  = { 0.14, 0.13, 0.11, 0.85 }  -- warm, sits on gold trim
 local PILL_BG_ACTIVE    = { 0.10, 0.45, 0.62, 0.95 }  -- WTFAY cyan
-local PILL_BG_HOVER     = { 0.14, 0.20, 0.24, 0.95 }
-local PILL_TXT_INACTIVE = { 0.62, 0.66, 0.68 }
+local PILL_BG_HOVER     = { 0.22, 0.20, 0.15, 0.95 }
+local PILL_TXT_INACTIVE = { 0.70, 0.66, 0.55 }
 local PILL_TXT_ACTIVE   = { 0.85, 0.97, 1.00 }
-local PILL_TXT_HOVER    = { 0.80, 0.90, 0.94 }
+local PILL_TXT_HOVER    = { 1.00, 0.82, 0.00 }  -- Blizzard UI gold on hover
+-- 1px physical-pixel edges (C.Hairline) instead of the tooltip edgeFile, which
+-- blurs at any UI scale but 1.0.
+local PILL_EDGE = {
+    inactive = { 0.42, 0.36, 0.24, 0.90 },  -- warm, matches the gold trim
+    active   = { 0.30, 0.75, 0.95, 1.00 },  -- WTFAY cyan
+    hover    = { 1.00, 0.82, 0.00, 0.90 },  -- Blizzard UI gold
+}
 
 local function MakePill(parent, label)
     local b = CreateFrame("Button", nil, parent)
@@ -485,12 +605,7 @@ local function MakePill(parent, label)
         b:OnBackdropLoaded()
     end
     if b.SetBackdrop then
-        b:SetBackdrop({
-            bgFile   = "Interface\\Buttons\\WHITE8x8",
-            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-            tile = true, tileSize = 8, edgeSize = 10,
-            insets = { left = 3, right = 3, top = 3, bottom = 3 },
-        })
+        b:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8x8" })
         b:SetBackdropColor(unpack(PILL_BG_INACTIVE))
     end
 
@@ -507,9 +622,11 @@ local function MakePill(parent, label)
         if active then
             self:SetBackdropColor(unpack(PILL_BG_ACTIVE))
             self.text:SetTextColor(unpack(PILL_TXT_ACTIVE))
+            C.Hairline(self, unpack(PILL_EDGE.active))
         else
             self:SetBackdropColor(unpack(PILL_BG_INACTIVE))
             self.text:SetTextColor(unpack(PILL_TXT_INACTIVE))
+            C.Hairline(self, unpack(PILL_EDGE.inactive))
         end
     end
     function b:IsActive() return self._active end
@@ -523,12 +640,14 @@ local function MakePill(parent, label)
         if not self._active and self.SetBackdropColor then
             self:SetBackdropColor(unpack(PILL_BG_HOVER))
             self.text:SetTextColor(unpack(PILL_TXT_HOVER))
+            C.Hairline(self, unpack(PILL_EDGE.hover))
         end
     end)
     b:SetScript("OnLeave", function(self)
         if not self._active and self.SetBackdropColor then
             self:SetBackdropColor(unpack(PILL_BG_INACTIVE))
             self.text:SetTextColor(unpack(PILL_TXT_INACTIVE))
+            C.Hairline(self, unpack(PILL_EDGE.inactive))
         end
     end)
 
@@ -539,9 +658,12 @@ end
 D("pill factory OK")
 
 ----------------------------------------------------------------------
--- Main window tabs: Database / Inbox
+-- Main window tabs: Database / Inbox / Settings
 ----------------------------------------------------------------------
 local mainTabButtons = {}
+local nativeMainTabs   -- native bottom tabs (Mainline only); built after the pills
+local NATIVE_TAB_INDEX = { Database = 1, Inbox = 2, Settings = 3 }
+local settingsPanel = { spec = {} }
 local dbElements = {}  -- database-specific UI elements to show/hide
 local inboxContent     -- forward declare
 local RefreshInbox     -- forward declare
@@ -560,20 +682,27 @@ local function UpdateInboxTabLabel()
     if btn then
         local count = GetInboxCount()
         if count > 0 then
-            btn.text:SetText("Inbox (|cFFFF8800" .. count .. "|r)")
+            btn.text:SetText("Inbox (" .. T.warn .. count .. "|r)")
         else
             btn.text:SetText("Inbox")
         end
         btn:FitLabel(60)
+        if nativeMainTabs and nativeMainTabs[2] then
+            C.SetNativeTabText(nativeMainTabs[2], btn.text:GetText())
+        end
     end
 end
 
 local activeMainTab = "Database"
 local function ShowMainTab(name)
+    if name == "Settings" and activeMainTab ~= "Settings" then
+        settingsPanel.returnTab = activeMainTab
+    end
     activeMainTab = name
     for tname, btn in pairs(mainTabButtons) do
         btn:SetActive(tname == name)
     end
+    if nativeMainTabs then C.SelectNativeTab(f, NATIVE_TAB_INDEX[name]) end
     -- Show/hide database elements
     local showDb = (name == "Database")
     for _, el in ipairs(dbElements) do
@@ -588,10 +717,14 @@ local function ShowMainTab(name)
             inboxContent:Hide()
         end
     end
+    if settingsPanel.frame then settingsPanel.frame:SetShown(name == "Settings") end
+    for _, btn in ipairs(settingsPanel.mainButtons or {}) do
+        btn:SetShown(name ~= "Settings")
+    end
 end
 
 do
-    local MAIN_TAB_NAMES = { "Database", "Inbox" }
+    local MAIN_TAB_NAMES = { "Database", "Inbox", "Settings" }
     local prev
     for _, tname in ipairs(MAIN_TAB_NAMES) do
         local btn = MakePill(f, tname)
@@ -605,6 +738,13 @@ do
         mainTabButtons[tname] = btn
         prev = btn
     end
+
+    -- Native bottom tabs, hanging off the frame like Character / Reputation.
+    if C.Mainline then
+        nativeMainTabs = C.CreateNativeTabs(f, MAIN_TAB_NAMES, function(i)
+            ShowMainTab(MAIN_TAB_NAMES[i])
+        end)
+    end
 end
 
 D("main tabs OK")
@@ -613,7 +753,7 @@ D("main tabs OK")
 -- Search bar
 ----------------------------------------------------------------------
 D("creating search box...")
-local searchBox = CreateFrame("EditBox", "WTFAYSearchBox", f, "InputBoxTemplate")
+local searchBox = CreateFrame("EditBox", "WTFAYSearchBox", f, C.SearchBoxTemplate)
 D("search box created")
 searchBox:SetSize(120, 22)
 searchBox:SetPoint("TOPLEFT", f, "TOPLEFT", 58, -56)
@@ -621,9 +761,16 @@ searchBox:SetAutoFocus(false)
 searchBox:SetFontObject(ChatFontNormal)
 searchBox:SetMaxLetters(40)
 
+-- The native search box carries its own magnifier + placeholder, so the
+-- external "Search:" label is redundant there.
 local searchLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 searchLabel:SetPoint("RIGHT", searchBox, "LEFT", -4, 0)
-searchLabel:SetText("|cFFCCCCCCSearch:|r")
+searchLabel:SetText(T.light .. "Search:|r")
+if C.HasSearchBox then
+    searchLabel:Hide()
+    searchBox:SetSize(150, 22)
+    if searchBox.Instructions then searchBox.Instructions:SetText("Search players") end
+end
 
 D("search bar OK")
 
@@ -649,7 +796,7 @@ ratingFilterBtn:SetSize(105, 22)
 ratingFilterBtn:SetPoint("LEFT", searchBox, "RIGHT", 4, 0)
 ratingFilterBtn:SetNormalFontObject(GameFontNormalSmall)
 ratingFilterBtn:SetHighlightFontObject(GameFontHighlightSmall)
-ratingFilterBtn:SetText("|cFFFFD100" .. ratingFilterPresets[1].label .. "|r")
+ratingFilterBtn:SetText(T.gold .. ratingFilterPresets[1].label .. "|r")
 
 local ratingFilterBg = ratingFilterBtn:CreateTexture(nil, "BACKGROUND")
 ratingFilterBg:SetAllPoints()
@@ -800,14 +947,48 @@ end
 -- Forward declare RefreshList (will be defined later, but we need it in header click)
 local RefreshList
 
--- Header column definitions: { field, label, point, offsetX }
+----------------------------------------------------------------------
+-- Column layout
+--
+-- Every column except Name is a fixed-width box anchored from the RIGHT,
+-- so widening the window grows Name instead of leaving a dead gap before
+-- Rating. Headers and rows both derive their geometry from these tables,
+-- which is what stops them drifting apart (the old fixed left offsets had
+-- "Lv" and "Class" pointing at nothing, and only 70px between Source and
+-- Last Seen, so multi-source values collided with the date).
+----------------------------------------------------------------------
+local COL_GAP   = 8
+-- Total fixed width is 360px (incl. gaps); MIN_W below is chosen so the
+-- flexible Name column still gets ~226px at the smallest window size.
+local COL_W     = { rating = 50, seen = 72, source = 84, class = 88, level = 26 }
+local COL_ORDER = { "rating", "seen", "source", "class", "level" }
+local COL_RIGHT = {}
+do
+    local x = -8
+    for _, k in ipairs(COL_ORDER) do
+        COL_RIGHT[k] = x
+        x = x - COL_W[k] - COL_GAP
+    end
+    COL_RIGHT.nameRight = x                                   -- Name stops here
+    COL_RIGHT.noteRight = COL_RIGHT.rating - COL_W.rating - COL_GAP
+end
+
+-- Anchor a font string into a right-hand column on the given line.
+local function AnchorCol(fs, parent, field, y)
+    fs:SetPoint("TOPRIGHT", parent, "TOPRIGHT", COL_RIGHT[field], y)
+    fs:SetWidth(COL_W[field])
+    fs:SetJustifyH("LEFT")
+    fs:SetWordWrap(false)
+end
+
+-- Header column definitions: { field, label, point }
 local HEADER_COLS = {
-    { field = "name",   label = "Name",    point = "LEFT",  offsetX = 4   },
-    { field = "level",  label = "Lv",      point = "LEFT",  offsetX = 120 },
-    { field = "class",  label = "Class",   point = "LEFT",  offsetX = 155 },
-    { field = "source", label = "Source",  point = "LEFT",  offsetX = 225 },
-    { field = "seen",   label = "Last Seen", point = "LEFT", offsetX = 295 },
-    { field = "rating", label = "Rating",  point = "RIGHT", offsetX = -4  },
+    { field = "name",   label = "Name",    point = "LEFT"  },
+    { field = "level",  label = "Lv",      point = "LEFT"  },
+    { field = "class",  label = "Class",   point = "LEFT"  },
+    { field = "source", label = "Source",  point = "LEFT"  },
+    { field = "seen",   label = "Last Seen", point = "LEFT" },
+    { field = "rating", label = "Rating",  point = "RIGHT" },
 }
 
 local headerButtons = {}
@@ -815,10 +996,10 @@ local headerButtons = {}
 local function UpdateHeaderArrows()
     for _, hb in ipairs(headerButtons) do
         if hb.field == sortField then
-            local arrow = (sortDirection == "asc") and " |cFF00CCFF^|r" or " |cFF00CCFFv|r"
-            hb.label:SetText("|cFFFFD100" .. hb.labelText .. arrow .. "|r")
+            local arrow = (sortDirection == "asc") and " " .. T.accent .. "^|r" or " " .. T.accent .. "v|r"
+            hb.label:SetText(T.gold .. hb.labelText .. arrow .. "|r")
         else
-            hb.label:SetText("|cFF999999" .. hb.labelText .. "|r")
+            hb.label:SetText(T.grey .. hb.labelText .. "|r")
         end
     end
 end
@@ -827,21 +1008,13 @@ for i, col in ipairs(HEADER_COLS) do
     local btn = CreateFrame("Button", nil, headerBar)
     btn:SetHeight(HEADER_HEIGHT)
 
-    if col.point == "RIGHT" then
-        btn:SetPoint("RIGHT", headerBar, "RIGHT", col.offsetX, 0)
-        btn:SetWidth(60)
+    if col.field == "name" then
+        -- Flexible column: absorbs the extra width when the window grows.
+        btn:SetPoint("LEFT", headerBar, "LEFT", 8, 0)
+        btn:SetPoint("RIGHT", headerBar, "RIGHT", COL_RIGHT.nameRight, 0)
     else
-        -- Calculate width from this column to the next (or a default)
-        local nextOffset = 9999
-        for j = i + 1, #HEADER_COLS do
-            if HEADER_COLS[j].point == "LEFT" then
-                nextOffset = HEADER_COLS[j].offsetX
-                break
-            end
-        end
-        local w = math.min(nextOffset - col.offsetX, 100)
-        btn:SetPoint("LEFT", headerBar, "LEFT", col.offsetX, 0)
-        btn:SetWidth(w)
+        btn:SetPoint("RIGHT", headerBar, "RIGHT", COL_RIGHT[col.field], 0)
+        btn:SetWidth(COL_W[col.field])
     end
 
     local lbl = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -856,7 +1029,7 @@ for i, col in ipairs(HEADER_COLS) do
     -- Hover highlight
     btn:SetScript("OnEnter", function(self)
         if self.field ~= sortField then
-            self.label:SetText("|cFFCCCCCC" .. self.labelText .. "|r")
+            self.label:SetText(T.light .. self.labelText .. "|r")
         end
     end)
     btn:SetScript("OnLeave", function(self)
@@ -915,6 +1088,14 @@ content:SetPoint("TOPLEFT", scrollParent, "TOPLEFT", 0, 0)
 content:SetPoint("BOTTOMRIGHT", scrollParent, "BOTTOMRIGHT", 0, 0)
 content:EnableMouse(false)
 
+-- Recessed frame behind the list so it reads as a native WoW list area.
+-- Deliberately kept at the parent frame level so rows draw on top of it.
+local listInset = C.CreateInset(f)
+listInset:SetPoint("TOPLEFT", scrollParent, "TOPLEFT", -4, 4)
+listInset:SetPoint("BOTTOMRIGHT", scrollParent, "BOTTOMRIGHT", 4, -4)
+listInset:EnableMouse(false)
+if listInset.SetFrameLevel then listInset:SetFrameLevel(f:GetFrameLevel()) end
+
 D("scroll frame OK")
 
 ----------------------------------------------------------------------
@@ -924,18 +1105,21 @@ local rows = {}
 -- Forward declaration so CreateRow closures can see it
 local ShowDetailPanel
 
-local function CreateRow(index)
-    local row = CreateFrame("Button", nil, content)
-    row:SetHeight(ROW_HEIGHT)
-    row:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -((index - 1) * ROW_HEIGHT))
-    row:SetPoint("RIGHT", content, "RIGHT", 0, 0)
+----------------------------------------------------------------------
+-- Row widgets
+--
+-- Shared by both scroll backends, so position/anchoring is deliberately
+-- NOT set here: the FauxScrollFrame path anchors rows absolutely, while
+-- ScrollBox positions and recycles them itself. Everything below must be
+-- safe to run once per pooled frame.
+----------------------------------------------------------------------
+local function BuildRowWidgets(row)
     row:EnableMouse(true)
     row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 
-    -- Backdrop via mixin if available
-    if BackdropTemplateMixin then
+    if BackdropTemplateMixin and not row.SetBackdrop then
         Mixin(row, BackdropTemplateMixin)
-        row:OnBackdropLoaded()
+        if row.OnBackdropLoaded then row:OnBackdropLoaded() end
     end
 
     if row.SetBackdrop then
@@ -943,17 +1127,12 @@ local function CreateRow(index)
             bgFile = "Interface\\Buttons\\WHITE8x8",
             insets = { left = 0, right = 0, top = 0, bottom = 1 },
         })
-        if index % 2 == 0 then
-            row:SetBackdropColor(0.12, 0.12, 0.15, 0.8)
-        else
-            row:SetBackdropColor(0.08, 0.08, 0.10, 0.8)
-        end
+        row:SetBackdropColor(unpack(C.Theme.rowA))
     end
 
-    -- Store base color for restoring after hover; updated per-row in RefreshList
-    row.baseR, row.baseG, row.baseB, row.baseA = 0.08, 0.08, 0.10, 0.8
+    -- Base color for restoring after hover; overwritten per row on populate.
+    row.baseR, row.baseG, row.baseB, row.baseA = unpack(C.Theme.rowA)
 
-    -- Hover highlight
     row:SetScript("OnEnter", function(self)
         if self.SetBackdropColor then
             self:SetBackdropColor(
@@ -970,35 +1149,38 @@ local function CreateRow(index)
         end
     end)
 
-    -- Name + class + level (line 1)
+    -- Line 1: one cell per header column.
     row.nameText = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    row.nameText:SetPoint("TOPLEFT", row, "TOPLEFT", 8, -4)
+    row.nameText:SetPoint("TOPLEFT", row, "TOPLEFT", 8, -5)
+    row.nameText:SetPoint("TOPRIGHT", row, "TOPRIGHT", COL_RIGHT.nameRight, -5)
     row.nameText:SetJustifyH("LEFT")
+    row.nameText:SetWordWrap(false)
 
-    -- Rating (right side)
+    row.levelText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    AnchorCol(row.levelText, row, "level", -6)
+
+    row.classText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    AnchorCol(row.classText, row, "class", -6)
+
+    row.sourceText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    AnchorCol(row.sourceText, row, "source", -6)
+
+    row.seenText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    AnchorCol(row.seenText, row, "seen", -6)
+
+    -- Rating spans both lines, right-aligned.
     row.ratingText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     row.ratingText:SetPoint("RIGHT", row, "RIGHT", -8, 0)
     row.ratingText:SetJustifyH("RIGHT")
 
-    -- Note (line 2)
+    -- Line 2: the note, spanning everything left of the rating column.
     row.noteText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.noteText:SetPoint("TOPLEFT", row.nameText, "BOTTOMLEFT", 0, -2)
-    row.noteText:SetPoint("RIGHT", row.ratingText, "LEFT", -12, 0)
+    row.noteText:SetPoint("TOPLEFT", row, "TOPLEFT", 8, -25)
+    row.noteText:SetPoint("TOPRIGHT", row, "TOPRIGHT", COL_RIGHT.noteRight, -25)
     row.noteText:SetJustifyH("LEFT")
     row.noteText:SetWordWrap(false)
 
-    -- Source (line 2, after note)
-    row.sourceText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.sourceText:SetPoint("TOPLEFT", row, "TOPLEFT", 225, -18)
-    row.sourceText:SetJustifyH("LEFT")
-
-    -- Last Seen
-    row.seenText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.seenText:SetPoint("TOPLEFT", row, "TOPLEFT", 295, -18)
-    row.seenText:SetJustifyH("LEFT")
-
     row.playerKey = nil
-    row:SetFrameLevel(content:GetFrameLevel() + 5)
 
     -- Left-click = detail, Right-click = context menu
     row:SetScript("OnClick", function(self, button)
@@ -1010,11 +1192,138 @@ local function CreateRow(index)
         end
     end)
 
+    row.wtfayBuilt = true
+end
+
+-- Fill a row from a player key. dataIdx drives the even/odd striping.
+local function PopulateRow(row, key, dataIdx)
+    local p = key and db and db.players and db.players[key]
+    if not p then
+        row.playerKey = nil
+        row:Hide()
+        return
+    end
+
+    local cc = ClassColor(p.class)
+    row.nameText:SetText(cc .. p.name .. "|r")
+    row.levelText:SetText(T.soft .. (p.level or "?") .. "|r")
+    local raceStr = (p.race and p.race ~= "") and (T.grey .. p.race .. "|r ") or ""
+    row.classText:SetText(raceStr .. cc .. (p.class or "") .. "|r")
+    row.ratingText:SetText(C.RatingIcon(p.rating or 0) .. ColorRating(p.rating or 0))
+
+    if p.note and p.note ~= "" then
+        row.noteText:SetText(T.text .. p.note .. "|r")
+    else
+        row.noteText:SetText(T.faint .. "(no note)|r")
+    end
+
+    local _, srcDisplay = GetPlayerSources(p)
+    row.sourceText:SetText(srcDisplay)
+    -- Year dropped in the list to keep the column narrow; the detail
+    -- panel and encounter history still show the full timestamp.
+    row.seenText:SetText(T.faint .. ((p.seen or ""):gsub("^%d+%-", "")) .. "|r")
+
+    row.playerKey = key
+
+    -- Subtle row tint based on rating
+    local r = p.rating or 0
+    local baseEven = ((dataIdx or 1) % 2 == 0)
+    local br, bg, bb, ba
+    if r <= -3 then
+        -- Blacklist: dark red tint
+        br, bg, bb, ba = baseEven and 0.22 or 0.18, 0.04, 0.04, 0.85
+    elseif r < 0 then
+        -- Negative: subtle warm/orange tint
+        br, bg, bb, ba = baseEven and 0.18 or 0.14, 0.08, 0.04, 0.82
+    elseif r == 0 then
+        -- Neutral: default grey
+        br, bg, bb, ba = baseEven and 0.12 or 0.08, baseEven and 0.12 or 0.08, baseEven and 0.15 or 0.10, 0.8
+    elseif r >= 5 then
+        -- Legend: subtle gold tint
+        br, bg, bb, ba = baseEven and 0.18 or 0.14, baseEven and 0.16 or 0.12, 0.04, 0.82
+    else
+        -- Positive: subtle green tint
+        br, bg, bb, ba = 0.04, baseEven and 0.16 or 0.12, 0.06, 0.82
+    end
+    row.baseR, row.baseG, row.baseB, row.baseA = br, bg, bb, ba
+    if row.SetBackdropColor then
+        row:SetBackdropColor(br, bg, bb, ba)
+    end
+
+    row:Show()
+end
+
+-- FauxScrollFrame path: rows are pooled by index and anchored absolutely.
+local function CreateRow(index)
+    local row = CreateFrame("Button", nil, content)
+    row:SetHeight(ROW_HEIGHT)
+    row:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -((index - 1) * ROW_HEIGHT))
+    row:SetPoint("RIGHT", content, "RIGHT", 0, 0)
+    BuildRowWidgets(row)
+    row:SetFrameLevel(content:GetFrameLevel() + 5)
     rows[index] = row
     return row
 end
 
 D("row pool code OK")
+
+----------------------------------------------------------------------
+-- ScrollBox list (Mainline only)
+--
+-- Modern clients get a real WowScrollBoxList + MinimalScrollBar: native
+-- scrollbar art, built-in wheel handling and frame recycling. TBC has none
+-- of that, so it stays on the FauxScrollFrame path above.
+--
+-- The whole setup is pcall'd. If any part of the API differs from what we
+-- expect we keep Faux rather than shipping a silently empty list — that
+-- failure mode is the whole reason this migration waited for a live client.
+----------------------------------------------------------------------
+local USE_SCROLLBOX = false
+local scrollBox, scrollBar
+
+if C.Mainline and ScrollUtil and CreateScrollBoxListLinearView and CreateDataProvider
+   and C.HasTemplate("WowScrollBoxList") and C.HasTemplate("MinimalScrollBar") then
+    local ok, err = pcall(function()
+        scrollBox = CreateFrame("Frame", nil, f, "WowScrollBoxList")
+        scrollBox:SetPoint("TOPLEFT", scrollParent, "TOPLEFT", 0, 0)
+        scrollBox:SetPoint("BOTTOMRIGHT", scrollParent, "BOTTOMRIGHT", -16, 0)
+
+        scrollBar = CreateFrame("EventFrame", nil, f, "MinimalScrollBar")
+        scrollBar:SetPoint("TOPLEFT", scrollBox, "TOPRIGHT", 6, 0)
+        scrollBar:SetPoint("BOTTOMLEFT", scrollBox, "BOTTOMRIGHT", 6, 0)
+
+        local view = CreateScrollBoxListLinearView()
+        view:SetElementExtent(ROW_HEIGHT)
+        view:SetElementInitializer("Button", function(row, elementData)
+            if not row.wtfayBuilt then BuildRowWidgets(row) end
+            PopulateRow(row, elementData.key, elementData.idx)
+        end)
+        ScrollUtil.InitScrollBoxListWithScrollBar(scrollBox, scrollBar, view)
+    end)
+
+    if ok then
+        USE_SCROLLBOX = true
+        -- Hide the Faux widgets. The template's scrollbar is a NAMED child and
+        -- has been seen surviving a parent Hide(), so kill it explicitly too --
+        -- otherwise it sits alongside the MinimalScrollBar as a second bar.
+        scrollFrame:Hide()
+        content:Hide()
+        local fauxName = scrollFrame:GetName()
+        if fauxName then
+            for _, suffix in ipairs({ "ScrollBar", "ScrollBarScrollUpButton",
+                                      "ScrollBarScrollDownButton", "ScrollChildFrame" }) do
+                local child = _G[fauxName .. suffix]
+                if child and child.Hide then child:Hide() end
+            end
+        end
+        D("ScrollBox list active")
+    else
+        D("ScrollBox init failed, falling back to FauxScrollFrame: " .. tostring(err))
+        if scrollBox then scrollBox:Hide() end
+        if scrollBar then scrollBar:Hide() end
+        scrollBox, scrollBar = nil, nil
+    end
+end
 
 ----------------------------------------------------------------------
 -- Right-click context menu (forward declared for CreateRow)
@@ -1027,14 +1336,7 @@ local ShowRatingPicker
 local AddTargetPlayer
 
 D("setting up context menu...")
-D("EasyMenu exists: " .. tostring(EasyMenu ~= nil))
-D("UIDropDownMenu_Initialize exists: " .. tostring(UIDropDownMenu_Initialize ~= nil))
-
-local menuFrame
-local menuOK, menuErr = pcall(function()
-    menuFrame = CreateFrame("Frame", "WTFAYDropDown", UIParent, "UIDropDownMenuTemplate")
-end)
-D("UIDropDownMenuTemplate create: " .. tostring(menuOK) .. " err=" .. tostring(menuErr))
+D("flavor: " .. C.flavorName .. " (interface " .. tostring(C.uiVersion) .. ")")
 
 function RowMenu(self)
     local key = self.playerKey
@@ -1045,82 +1347,40 @@ function RowMenu(self)
     end
     local p = db.players[key]
 
-    -- Build the whisper target: "Name-Realm" for cross-realm, "Name" for same-realm
+    -- Whisper target: realm-qualify only for cross-realm, and only on flavors
+    -- that have realms at all (Forever names carry no realm suffix).
+    -- Compare against the NORMALIZED realm - GetRealmName() returns the display
+    -- form ("Azjol-Nerub") and would never match the stored "AzjolNerub".
     local whisperTarget = p.name
-    local myRealm = GetRealmName() or ""
-    if p.realm and p.realm ~= "" and p.realm ~= myRealm then
+    if C.UsesRealms and p.realm and p.realm ~= "" and p.realm ~= C.MyRealm() then
         whisperTarget = p.name .. "-" .. p.realm
     end
 
-    if EasyMenu and menuFrame then
-        D("RowMenu: using EasyMenu")
-        local menu = {
-            { text = ClassColor(p.class) .. p.name .. "|r", isTitle = true, notCheckable = true },
-            { text = "Whisper",     notCheckable = true, func = function()
-                ChatFrame_OpenChat("/w " .. whisperTarget .. " ")
-            end },
-            { text = "Invite",      notCheckable = true, func = function()
-                InviteUnit(whisperTarget)
-                P("Invited " .. ClassColor(p.class) .. p.name .. "|r")
-            end },
-            { text = "Set Rating",  notCheckable = true, func = function()
-                ShowRatingPicker(key)
-            end },
-            { text = "Edit Note",   notCheckable = true, func = function()
-                popupActiveKey = key
-                StaticPopup_Show("WTFAY_EDIT_NOTE", p.name)
-            end },
-            { text = "|cFFFF4444Remove|r", notCheckable = true, func = function()
-                popupActiveKey = key
-                StaticPopup_Show("WTFAY_CONFIRM_REMOVE", p.name)
-            end },
-            { text = "Cancel", notCheckable = true },
-        }
-        local ok, err = pcall(EasyMenu, menu, menuFrame, "cursor", 0, 0, "MENU")
-        D("EasyMenu result: ok=" .. tostring(ok) .. " err=" .. tostring(err))
-    elseif UIDropDownMenu_Initialize and menuFrame then
-        D("RowMenu: using UIDropDownMenu_Initialize fallback")
-        UIDropDownMenu_Initialize(menuFrame, function(self, level)
-            local info
-            info = UIDropDownMenu_CreateInfo()
-            info.text = ClassColor(p.class) .. p.name .. "|r"
-            info.isTitle = true
-            info.notCheckable = true
-            UIDropDownMenu_AddButton(info, level)
+    local shown = C.ShowContextMenu(self, {
+        { text = ClassColor(p.class) .. p.name .. "|r", isTitle = true },
+        { text = "Whisper", func = function()
+            ChatFrame_OpenChat("/w " .. whisperTarget .. " ")
+        end },
+        { text = "Invite", func = function()
+            C.InviteByName(whisperTarget)
+            P("Invited " .. ClassColor(p.class) .. p.name .. "|r")
+        end },
+        { text = "Set Rating", func = function()
+            ShowRatingPicker(key)
+        end },
+        { text = "Edit Note", func = function()
+            popupActiveKey = key
+            StaticPopup_Show("WTFAY_EDIT_NOTE", p.name)
+        end },
+        { text = T.off .. "Remove|r", func = function()
+            popupActiveKey = key
+            StaticPopup_Show("WTFAY_CONFIRM_REMOVE", p.name)
+        end },
+        { text = "Cancel" },
+    })
 
-            info = UIDropDownMenu_CreateInfo()
-            info.text = "Whisper"
-            info.notCheckable = true
-            info.func = function() ChatFrame_OpenChat("/w " .. whisperTarget .. " ") end
-            UIDropDownMenu_AddButton(info, level)
-
-            info = UIDropDownMenu_CreateInfo()
-            info.text = "Invite"
-            info.notCheckable = true
-            info.func = function() InviteUnit(whisperTarget); P("Invited " .. ClassColor(p.class) .. p.name .. "|r") end
-            UIDropDownMenu_AddButton(info, level)
-
-            info = UIDropDownMenu_CreateInfo()
-            info.text = "Set Rating"
-            info.notCheckable = true
-            info.func = function() ShowRatingPicker(key) end
-            UIDropDownMenu_AddButton(info, level)
-
-            info = UIDropDownMenu_CreateInfo()
-            info.text = "Edit Note"
-            info.notCheckable = true
-            info.func = function() popupActiveKey = key; StaticPopup_Show("WTFAY_EDIT_NOTE", p.name) end
-            UIDropDownMenu_AddButton(info, level)
-
-            info = UIDropDownMenu_CreateInfo()
-            info.text = "|cFFFF4444Remove|r"
-            info.notCheckable = true
-            info.func = function() popupActiveKey = key; StaticPopup_Show("WTFAY_CONFIRM_REMOVE", p.name) end
-            UIDropDownMenu_AddButton(info, level)
-        end, "MENU")
-        ToggleDropDownMenu(1, nil, menuFrame, "cursor", 0, 0)
-    else
-        D("RowMenu: NO menu system available, falling back to rating picker")
+    if not shown then
+        D("RowMenu: no menu system available, falling back to rating picker")
         ShowRatingPicker(key)
     end
 end
@@ -1140,7 +1400,7 @@ RefreshList = function()
     RebuildSorted(filterText, rf.min, rf.max, sf.value, cf.value)
 
     local total = #sortedKeys
-    countLabel:SetText("|cFFAAAAAA" .. total .. " player" .. (total == 1 and "" or "s") .. "|r")
+    countLabel:SetText(T.muted .. total .. " player" .. (total == 1 and "" or "s") .. "|r")
 
     local parentH = scrollParent:GetHeight()
     local parentW = scrollParent:GetWidth()
@@ -1153,6 +1413,17 @@ RefreshList = function()
       .. " visibleRows=" .. visibleRows
       .. " contentW=" .. string.format("%.0f", content:GetWidth()))
 
+    -- ScrollBox owns layout, recycling and scrolling; we just hand it data.
+    if USE_SCROLLBOX and scrollBox then
+        local list = {}
+        for i = 1, total do
+            list[i] = { key = sortedKeys[i], idx = i }
+        end
+        scrollBox:SetDataProvider(CreateDataProvider(list))
+        UpdateInboxTabLabel()
+        return
+    end
+
     FauxScrollFrame_Update(scrollFrame, total, visibleRows, ROW_HEIGHT)
 
     local offset = FauxScrollFrame_GetOffset(scrollFrame)
@@ -1161,52 +1432,7 @@ RefreshList = function()
         local row = rows[i] or CreateRow(i)
         local dataIdx = offset + i
         if dataIdx <= total then
-            local key = sortedKeys[dataIdx]
-            local p   = db.players[key]
-
-            local cc = ClassColor(p.class)
-            local raceStr = (p.race and p.race ~= "") and ("|cFFBBBBBB" .. p.race .. "|r ") or ""
-            row.nameText:SetText(cc .. p.name .. "|r  |cFFBBBBBBLv " .. (p.level or "?") .. "|r  " .. raceStr .. cc .. (p.class or "") .. "|r")
-            row.ratingText:SetText(ColorRating(p.rating or 0))
-
-            if p.note and p.note ~= "" then
-                row.noteText:SetText("|cFFDDDDDD" .. p.note .. "|r")
-            else
-                row.noteText:SetText("|cFF666666(no note)|r")
-            end
-
-            local _, srcDisplay = GetPlayerSources(p)
-            row.sourceText:SetText(srcDisplay)
-            row.seenText:SetText("|cFF666666" .. (p.seen or "") .. "|r")
-
-            row.playerKey = key
-
-            -- Subtle row tint based on rating
-            local r = p.rating or 0
-            local baseEven = (dataIdx % 2 == 0)
-            local br, bg, bb, ba
-            if r <= -3 then
-                -- Blacklist: dark red tint
-                br, bg, bb, ba = baseEven and 0.22 or 0.18, 0.04, 0.04, 0.85
-            elseif r < 0 then
-                -- Negative: subtle warm/orange tint
-                br, bg, bb, ba = baseEven and 0.18 or 0.14, 0.08, 0.04, 0.82
-            elseif r == 0 then
-                -- Neutral: default grey
-                br, bg, bb, ba = baseEven and 0.12 or 0.08, baseEven and 0.12 or 0.08, baseEven and 0.15 or 0.10, 0.8
-            elseif r >= 5 then
-                -- Legend: subtle gold tint
-                br, bg, bb, ba = baseEven and 0.18 or 0.14, baseEven and 0.16 or 0.12, 0.04, 0.82
-            else
-                -- Positive: subtle green tint
-                br, bg, bb, ba = 0.04, baseEven and 0.16 or 0.12, 0.06, 0.82
-            end
-            row.baseR, row.baseG, row.baseB, row.baseA = br, bg, bb, ba
-            if row.SetBackdropColor then
-                row:SetBackdropColor(br, bg, bb, ba)
-            end
-
-            row:Show()
+            PopulateRow(row, sortedKeys[dataIdx], dataIdx)
         else
             row:Hide()
         end
@@ -1219,11 +1445,29 @@ RefreshList = function()
     UpdateInboxTabLabel()
 end
 
+-- Mouse wheel scrolling. FauxScrollFrame drives itself through its
+-- named scrollbar, which also gives us clamping for free. Shift
+-- scrolls a page at a time.
+scrollFrame:EnableMouseWheel(true)
+scrollFrame:SetScript("OnMouseWheel", function(self, delta)
+    local step = IsShiftKeyDown() and 5 or 1
+    local name = self:GetName()
+    local bar = name and _G[name .. "ScrollBar"]
+    if bar and bar.SetValue and bar.GetValue then
+        bar:SetValue(bar:GetValue() - delta * ROW_HEIGHT * step)
+    else
+        local cur = FauxScrollFrame_GetOffset(self) or 0
+        local new = cur - delta * step
+        if new < 0 then new = 0 end
+        self:SetVerticalScroll(new * ROW_HEIGHT)
+    end
+end)
+
 scrollFrame:SetScript("OnVerticalScroll", function(self, offset)
     FauxScrollFrame_OnVerticalScroll(self, offset, ROW_HEIGHT, RefreshList)
 end)
 
-searchBox:SetScript("OnTextChanged", function() RefreshList() end)
+C.HookSearchBoxChanged(searchBox, function() RefreshList() end)
 
 ratingFilterBtn:SetScript("OnClick", function(self, button)
     if button == "RightButton" then
@@ -1233,7 +1477,7 @@ ratingFilterBtn:SetScript("OnClick", function(self, button)
         currentRatingFilterIdx = currentRatingFilterIdx + 1
         if currentRatingFilterIdx > #ratingFilterPresets then currentRatingFilterIdx = 1 end
     end
-    self:SetText("|cFFFFD100" .. ratingFilterPresets[currentRatingFilterIdx].label .. "|r")
+    self:SetText(T.gold .. ratingFilterPresets[currentRatingFilterIdx].label .. "|r")
     RefreshList()
 end)
 ratingFilterBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
@@ -1283,7 +1527,7 @@ f:SetScript("OnShow", function()
         D("OnShow delayed refresh: scrollParent height=" .. tostring(scrollParent:GetHeight()))
         if activeMainTab == "Database" then
             RefreshList()
-        elseif RefreshInbox then
+        elseif activeMainTab == "Inbox" and RefreshInbox then
             RefreshInbox()
         end
     end)
@@ -1292,7 +1536,20 @@ end)
 D("refresh list code OK")
 
 -- Register database-specific UI elements for tab switching
-dbElements = { searchBox, searchLabel, ratingFilterBtn, classFilterBtn, groupFilterPill, countLabel, headerBar, scrollParent, scrollFrame, content }
+-- Only what the Database tab really shows. ShowMainTab re-Show()s every entry
+-- on each switch, so a widget hidden on purpose must not be listed: the Faux
+-- scroll frame used to be re-shown under the ScrollBox (a second scrollbar),
+-- the ScrollBox itself was missing (so it stayed up behind the Inbox), and the
+-- redundant "Search:" label kept reappearing beside the native search box.
+dbElements = { searchBox, ratingFilterBtn, classFilterBtn, groupFilterPill, countLabel, headerBar, scrollParent, listInset }
+if not C.HasSearchBox then dbElements[#dbElements + 1] = searchLabel end
+if USE_SCROLLBOX and scrollBox then
+    dbElements[#dbElements + 1] = scrollBox
+    dbElements[#dbElements + 1] = scrollBar
+else
+    dbElements[#dbElements + 1] = scrollFrame
+    dbElements[#dbElements + 1] = content
+end
 for _, b in ipairs(sourcePills) do
     dbElements[#dbElements + 1] = b
 end
@@ -1308,15 +1565,18 @@ do
 
     local inboxTitle = inboxContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     inboxTitle:SetPoint("TOPLEFT", inboxContent, "TOPLEFT", 4, -4)
-    inboxTitle:SetText("|cFFAAAAAAPlayers to review — rate or dismiss:|r")
+    inboxTitle:SetText(T.muted .. "Players to review — rate or dismiss:|r")
 
     -- Purge All button
-    local purgeBtn = CreateFrame("Button", nil, inboxContent, "UIPanelButtonTemplate")
+    local purgeBtn = CreateFrame("Button", nil, inboxContent, C.ButtonTemplate)
     purgeBtn:SetSize(70, 20)
     purgeBtn:SetPoint("TOPRIGHT", inboxContent, "TOPRIGHT", 0, -2)
     purgeBtn:SetText("Purge All")
-    purgeBtn:SetScript("OnClick", function()
-        StaticPopup_Show("WTFAY_PURGE_INBOX")
+    -- Two clicks within 3s instead of a modal popup. The popup's OnAccept
+    -- still holds the purge logic, so there is one implementation of it.
+    C.ArmConfirm(purgeBtn, function()
+        local dlg = StaticPopupDialogs["WTFAY_PURGE_INBOX"]
+        if dlg and dlg.OnAccept then dlg.OnAccept() end
     end)
 
     StaticPopupDialogs["WTFAY_PURGE_INBOX"] = {
@@ -1353,6 +1613,12 @@ do
     local inboxContentFrame = CreateFrame("Frame", nil, inboxContent)
     inboxContentFrame:SetPoint("TOPLEFT", inboxScrollParent, "TOPLEFT", 0, 0)
     inboxContentFrame:SetPoint("BOTTOMRIGHT", inboxScrollParent, "BOTTOMRIGHT", 0, 0)
+
+    local inboxInset = C.CreateInset(inboxContent)
+    inboxInset:SetPoint("TOPLEFT", inboxScrollParent, "TOPLEFT", -4, 4)
+    inboxInset:SetPoint("BOTTOMRIGHT", inboxScrollParent, "BOTTOMRIGHT", 4, -4)
+    inboxInset:EnableMouse(false)
+    if inboxInset.SetFrameLevel then inboxInset:SetFrameLevel(inboxContent:GetFrameLevel()) end
 
     local inboxRows = {}
     local inboxSortedKeys = {}
@@ -1428,7 +1694,7 @@ do
         row.infoText:SetText("")
 
         -- Dismiss button
-        row.dismissBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        row.dismissBtn = CreateFrame("Button", nil, row, C.ButtonTemplate)
         row.dismissBtn:SetSize(54, 20)
         row.dismissBtn:SetPoint("RIGHT", row, "RIGHT", -4, 0)
         row.dismissBtn:SetText("Dismiss")
@@ -1441,9 +1707,14 @@ do
         end)
 
         -- Rate button
-        row.rateBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        row.rateBtn = CreateFrame("Button", nil, row, C.ButtonTemplate)
         row.rateBtn:SetSize(42, 20)
         row.rateBtn:SetPoint("RIGHT", row.dismissBtn, "LEFT", -4, 0)
+        -- Clip the info line against the buttons, so a long zone truncates
+        -- instead of running underneath them.
+        row.infoText:SetPoint("RIGHT", row.rateBtn, "LEFT", -8, 0)
+        row.infoText:SetJustifyH("LEFT")
+        row.infoText:SetWordWrap(false)
         row.rateBtn:SetText("Rate")
         row.rateBtn:SetScript("OnClick", function()
             if row.playerKey and ShowRatingPicker then
@@ -1486,8 +1757,12 @@ do
                     if p.class and p.class ~= "" then parts[#parts + 1] = p.class end
                     local _, srcDisplay = GetPlayerSources(p)
                     if srcDisplay ~= "" then parts[#parts + 1] = srcDisplay end
-                    if p.seen then parts[#parts + 1] = "|cFF666666" .. p.seen .. "|r" end
-                    row.infoText:SetText("|cFFAAAAAA" .. table.concat(parts, "  ") .. "|r")
+                    local lastEnc = p.encounters and p.encounters[#p.encounters]
+                    if lastEnc and lastEnc.zone and lastEnc.zone ~= "" then
+                        parts[#parts + 1] = T.brass .. lastEnc.zone .. "|r"
+                    end
+                    if p.seen then parts[#parts + 1] = T.faint .. p.seen .. "|r" end
+                    row.infoText:SetText(T.muted .. table.concat(parts, "  ") .. "|r")
                     row.playerKey = key
                     -- Alternate row colors + store base for hover restore
                     if row.SetBackdropColor then
@@ -1514,6 +1789,24 @@ do
         UpdateInboxTabLabel()
     end
 
+    -- Mouse wheel scrolling. FauxScrollFrame drives itself through its
+    -- named scrollbar, which also gives us clamping for free. Shift
+    -- scrolls a page at a time.
+    inboxScrollFrame:EnableMouseWheel(true)
+    inboxScrollFrame:SetScript("OnMouseWheel", function(self, delta)
+        local step = IsShiftKeyDown() and 5 or 1
+        local name = self:GetName()
+        local bar = name and _G[name .. "ScrollBar"]
+        if bar and bar.SetValue and bar.GetValue then
+            bar:SetValue(bar:GetValue() - delta * INBOX_ROW_HEIGHT * step)
+        else
+            local cur = FauxScrollFrame_GetOffset(self) or 0
+            local new = cur - delta * step
+            if new < 0 then new = 0 end
+            self:SetVerticalScroll(new * INBOX_ROW_HEIGHT)
+        end
+    end)
+
     inboxScrollFrame:SetScript("OnVerticalScroll", function(self, offset)
         FauxScrollFrame_OnVerticalScroll(self, offset, INBOX_ROW_HEIGHT, RefreshInbox)
     end)
@@ -1525,51 +1818,24 @@ D("inbox tab OK")
 local minimapBtn
 
 ----------------------------------------------------------------------
--- Settings Panel
+-- Settings tab (also records the spec used by the game's AddOns menu)
 ----------------------------------------------------------------------
-local settingsPanel = {}
 
 do
-    local sp = CreateFrame("Frame", "WTFAYSettingsPanel", UIParent)
-    sp:SetSize(280, 460)
-    sp:SetPoint("CENTER", UIParent, "CENTER", 0, 60)
-    sp:SetFrameStrata("FULLSCREEN_DIALOG")
-    sp:SetMovable(true)
-    sp:EnableMouse(true)
-    sp:RegisterForDrag("LeftButton")
-    sp:SetClampedToScreen(true)
-    sp:SetScript("OnDragStart", function(s) s:StartMoving() end)
-    sp:SetScript("OnDragStop", function(s) s:StopMovingOrSizing() end)
+    local sp = CreateFrame("Frame", "WTFAYSettingsPanel", f)
+    sp:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -56)
+    sp:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 10)
     sp:Hide()
-
-    if BackdropTemplateMixin then
-        Mixin(sp, BackdropTemplateMixin)
-        sp:OnBackdropLoaded()
-    end
-    if sp.SetBackdrop then
-        sp:SetBackdrop({
-            bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-            tile = true, tileSize = 32, edgeSize = 24,
-            insets = { left = 6, right = 6, top = 6, bottom = 6 },
-        })
-        sp:SetBackdropColor(0.05, 0.05, 0.08, 0.96)
-    end
-
-    -- Close on Escape
-    do
-        local nm = sp:GetName()
-        if nm then tinsert(UISpecialFrames, nm) end
-    end
-
-    -- Close button
-    local spClose = CreateFrame("Button", nil, sp, "UIPanelCloseButton")
-    spClose:SetPoint("TOPRIGHT", sp, "TOPRIGHT", -2, -2)
+    settingsPanel.frame = sp
 
     -- Title
     local spTitle = sp:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    spTitle:SetPoint("TOP", sp, "TOP", 0, -14)
-    spTitle:SetText("|cFF" .. ACCENT .. "WTFAY Settings|r")
+    spTitle:SetPoint("TOPLEFT", sp, "TOPLEFT", 4, -4)
+    spTitle:SetText(T.gold .. "Settings|r")
+
+    local hint = sp:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    hint:SetPoint("TOPRIGHT", sp, "TOPRIGHT", -4, -8)
+    hint:SetText(T.dim .. "Changes apply immediately.|r")
 
     ----------------------------------------------------------------
     -- Tab bar
@@ -1577,12 +1843,13 @@ do
     local TAB_NAMES = { "General", "Alerts", "Display" }
     local tabButtons = {}
     local tabContents = {}
+    local tabScrolls = {}
+    local tabHeights = { General = 220, Alerts = 360, Display = 280 }
     local activeTab = "General"
 
     local tabWidth = 80
-    local tabBarY = -36
-    local totalWidth = tabWidth * #TAB_NAMES
-    local startX = (280 - totalWidth) / 2
+    local tabBarY = -30
+    local startX = 4
 
     for i, name in ipairs(TAB_NAMES) do
         local btn = CreateFrame("Button", nil, sp)
@@ -1605,8 +1872,8 @@ do
         btn:SetScript("OnClick", function()
             activeTab = name
             for _, n in ipairs(TAB_NAMES) do
-                if tabContents[n] then
-                    if n == name then tabContents[n]:Show() else tabContents[n]:Hide() end
+                if tabScrolls[n] then
+                    tabScrolls[n]:SetShown(n == name)
                 end
                 if tabButtons[n] then
                     if n == name then
@@ -1616,6 +1883,8 @@ do
                         tabButtons[n].label:SetTextColor(0.6, 0.6, 0.6)
                         tabButtons[n].underline:Hide()
                     end
+                    -- Native skin: the client's Options_Tab art instead of the underline.
+                    C.SkinTab(tabButtons[n], n == name)
                 end
             end
         end)
@@ -1623,13 +1892,27 @@ do
         tabButtons[name] = btn
     end
 
-    -- Content frames (one per tab)
+    -- Each section scrolls so every option stays reachable at minimum window height.
     for _, name in ipairs(TAB_NAMES) do
-        local cf = CreateFrame("Frame", nil, sp)
-        cf:SetPoint("TOPLEFT", sp, "TOPLEFT", 0, tabBarY - 24)
-        cf:SetPoint("BOTTOMRIGHT", sp, "BOTTOMRIGHT", 0, 60)
-        cf:Hide()
+        local scroll = CreateFrame("ScrollFrame", "WTFAYSettings" .. name .. "Scroll", sp, "UIPanelScrollFrameTemplate")
+        scroll:SetPoint("TOPLEFT", sp, "TOPLEFT", 0, tabBarY - 28)
+        scroll:SetPoint("BOTTOMRIGHT", sp, "BOTTOMRIGHT", -24, 36)
+        scroll:Hide()
+        local cf = CreateFrame("Frame", nil, scroll)
+        cf:SetSize(400, tabHeights[name])
+        scroll:SetScrollChild(cf)
+        scroll:SetScript("OnSizeChanged", function(self, width)
+            if width and width > 0 then cf:SetWidth(width) end
+            -- Resizing a tall window after scrolling must not leave an empty section.
+            local maxOffset = math.max(0, cf:GetHeight() - self:GetHeight())
+            self:SetVerticalScroll(math.min(self:GetVerticalScroll(), maxOffset))
+        end)
+        scroll:HookScript("OnShow", function(self)
+            local resize = self:GetScript("OnSizeChanged")
+            resize(self, self:GetWidth())
+        end)
         tabContents[name] = cf
+        tabScrolls[name] = scroll
     end
 
     -- Show default tab
@@ -1640,15 +1923,11 @@ do
     ----------------------------------------------------------------
     -- Helper: create a toggle row (checkbox + label + description)
     ----------------------------------------------------------------
-    local function CreateToggle(parent, yOffset, label, description, getter, setter)
-        local row = CreateFrame("CheckButton", nil, parent)
+    local function CreateToggle(parent, yOffset, label, description, getter, setter, default)
+        local row = C.CreateCheckbox(parent)
         row:SetSize(24, 24)
         row:SetPoint("TOPLEFT", parent, "TOPLEFT", 16, yOffset)
 
-        row:SetNormalTexture("Interface\\Buttons\\UI-CheckBox-Up")
-        row:SetPushedTexture("Interface\\Buttons\\UI-CheckBox-Down")
-        row:SetHighlightTexture("Interface\\Buttons\\UI-CheckBox-Highlight", "ADD")
-        row:SetCheckedTexture("Interface\\Buttons\\UI-CheckBox-Check")
 
         local lbl = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         lbl:SetPoint("LEFT", row, "RIGHT", 4, 0)
@@ -1658,19 +1937,121 @@ do
         desc:SetPoint("TOPLEFT", lbl, "BOTTOMLEFT", 0, -2)
         desc:SetPoint("RIGHT", parent, "RIGHT", -16, 0)
         desc:SetJustifyH("LEFT")
-        desc:SetText("|cFF888888" .. description .. "|r")
+        desc:SetText(T.dim .. description .. "|r")
         desc:SetWordWrap(true)
 
-        row:SetScript("OnClick", function(self)
-            local val = self:GetChecked() and true or false
-            setter(val)
-        end)
+        C.BindToggle(row, label, description, setter, default)
 
         row.Refresh = function()
             row:SetChecked(getter())
         end
 
+        -- Recorded too, so the game's AddOns menu rebuilds exactly these
+        -- settings in the same sections (see the options panel below).
+        local section = "General"
+        for name, frame in pairs(tabContents) do
+            if frame == parent then section = name end
+        end
+        settingsPanel.spec[#settingsPanel.spec + 1] = {
+            kind = "toggle", section = section, label = label, description = description,
+            getter = getter, setter = setter, default = default,
+        }
+
         return row
+    end
+
+    ----------------------------------------------------------------
+    -- Shared pickers
+    --
+    -- Both settings panels build these through the same functions, so the
+    -- game's AddOns menu can't drift from /wtfay settings. Each returns a
+    -- refresh function, or nil when it doesn't apply on this client.
+    ----------------------------------------------------------------
+    local function RecordCustom(section, height, build)
+        settingsPanel.spec[#settingsPanel.spec + 1] = {
+            kind = "custom", section = section, height = height, build = build,
+        }
+    end
+
+    function settingsPanel.BuildSoundPicker(parent, y)
+        local soundLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        soundLabel:SetPoint("TOPLEFT", parent, "TOPLEFT", 22, y)
+        soundLabel:SetText(T.soft .. "Sound:|r")
+
+        -- UIDropDownMenu_* is gone on Mainline; the compat layer swaps in a
+        -- MenuUtil-backed button there and keeps the classic dropdown on TBC.
+        local dd
+        dd = C.CreateDropdown(parent, 130, function()
+            local entries = {}
+            for i, snd in ipairs(ALERT_SOUNDS) do
+                entries[#entries + 1] = {
+                    text    = snd.name,
+                    checked = (db and db.settings and db.settings.alertSoundChoice == i),
+                    func    = function()
+                        if db and db.settings then db.settings.alertSoundChoice = i end
+                        dd:SetLabel(snd.name)
+                        PlaySound(snd.normal)
+                    end,
+                }
+            end
+            return entries
+        end)
+        dd:SetPoint("LEFT", soundLabel, "RIGHT", -8, -2)
+
+        local previewBtn = CreateFrame("Button", nil, parent, C.ButtonTemplate)
+        previewBtn:SetSize(40, 22)
+        previewBtn:SetPoint("LEFT", dd, "RIGHT", -4, 2)
+        previewBtn:SetText("Test")
+        previewBtn:SetScript("OnClick", function()
+            local idx = db and db.settings and db.settings.alertSoundChoice or 1
+            local choice = ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]
+            PlaySound(choice.normal)
+        end)
+        previewBtn:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Preview sound")
+            GameTooltip:Show()
+        end)
+        previewBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+        return function()
+            local idx = db and db.settings and db.settings.alertSoundChoice or 1
+            dd:SetLabel((ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]).name)
+        end
+    end
+
+    local SKIN_LABELS = { native = "Native (game UI)", dark = "Dark (classic WTFAY)" }
+    local function CurrentSkinKey()
+        local k = db and db.settings and db.settings.skin
+        if k ~= "native" and k ~= "dark" then k = C.DefaultSkin() end
+        return k
+    end
+
+    -- Window style: Mainline only, since Classic has no native look to pick.
+    function settingsPanel.BuildSkinPicker(parent, y)
+        if not C.CanChooseSkin() then return nil end
+        local skinLabel = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        skinLabel:SetPoint("TOPLEFT", parent, "TOPLEFT", 20, y)
+        skinLabel:SetText("Window Style")
+        local dd
+        dd = C.CreateDropdown(parent, 150, function()
+            local entries = {}
+            for _, key in ipairs({ "native", "dark" }) do
+                entries[#entries + 1] = {
+                    text    = SKIN_LABELS[key],
+                    checked = (CurrentSkinKey() == key),
+                    func    = function()
+                        if db and db.settings then db.settings.skin = key end
+                        C.SetSkin(key)
+                        dd:SetLabel(SKIN_LABELS[key])
+                        P("Window style: " .. T.on .. SKIN_LABELS[key] .. "|r")
+                    end,
+                }
+            end
+            return entries
+        end)
+        dd:SetPoint("LEFT", skinLabel, "RIGHT", 8, 0)
+        return function() dd:SetLabel(SKIN_LABELS[CurrentSkinKey()]) end
     end
 
     ----------------------------------------------------------------
@@ -1685,8 +2066,8 @@ do
         function(val)
             DEBUG = val
             if db and db.settings then db.settings.debug = val end
-            P("Debug mode: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
+            P("Debug mode: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.debug
     )
 
     local autoTrackToggle = CreateToggle(gc, -60,
@@ -1695,8 +2076,28 @@ do
         function() return db and db.settings and db.settings.autoTrack or false end,
         function(val)
             if db and db.settings then db.settings.autoTrack = val end
-            P("Auto-tracking: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
+            P("Auto-tracking: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.autoTrack
+    )
+
+    local whoEnrichToggle = CreateToggle(gc, -110,
+        "Fill In Details via /who",
+        "Look up class, level, guild, and zone for players added by name. Throttled to one lookup every few seconds.",
+        function() return db and db.settings and db.settings.whoEnrich or false end,
+        function(val)
+            if db and db.settings then db.settings.whoEnrich = val end
+            P("/who enrichment: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.whoEnrich
+    )
+
+    local unitMenuToggle = CreateToggle(gc, -170,
+        "Right-Click Menu Entry",
+        "Add \"WTFAY: Rate / Note\" to the right-click menu on unit frames, chat names, and the friends list.",
+        function() return db and db.settings and db.settings.unitMenu or false end,
+        function(val)
+            if db and db.settings then db.settings.unitMenu = val end
+            P("Unit menu entry: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.unitMenu
     )
 
     ----------------------------------------------------------------
@@ -1710,8 +2111,8 @@ do
         function() return db and db.settings and db.settings.knownAlerts or false end,
         function(val)
             if db and db.settings then db.settings.knownAlerts = val end
-            P("Known player alerts: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
+            P("Known player alerts: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.knownAlerts
     )
 
     local alertJoinToggle = CreateToggle(ac, -48,
@@ -1720,8 +2121,8 @@ do
         function() return db and db.settings and db.settings.alertOnJoin or false end,
         function(val)
             if db and db.settings then db.settings.alertOnJoin = val end
-            P("Alert on join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
+            P("Alert on join: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.alertOnJoin
     )
 
     local alertLeaveToggle = CreateToggle(ac, -86,
@@ -1730,8 +2131,8 @@ do
         function() return db and db.settings and db.settings.alertOnLeave or false end,
         function(val)
             if db and db.settings then db.settings.alertOnLeave = val end
-            P("Alert on leave: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
+            P("Alert on leave: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.alertOnLeave
     )
 
     local alertMeJoinToggle = CreateToggle(ac, -124,
@@ -1740,8 +2141,8 @@ do
         function() return db and db.settings and db.settings.alertOnMeJoin or false end,
         function(val)
             if db and db.settings then db.settings.alertOnMeJoin = val end
-            P("Alert on me join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
+            P("Alert on me join: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.alertOnMeJoin
     )
 
     local alertPopupToggle = CreateToggle(ac, -174,
@@ -1750,8 +2151,8 @@ do
         function() return db and db.settings and db.settings.alertPopup or false end,
         function(val)
             if db and db.settings then db.settings.alertPopup = val end
-            P("Alert popup: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
+            P("Alert popup: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.alertPopup
     )
 
     local alertSoundToggle = CreateToggle(ac, -224,
@@ -1760,51 +2161,13 @@ do
         function() return db and db.settings and db.settings.alertSound or false end,
         function(val)
             if db and db.settings then db.settings.alertSound = val end
-            P("Alert sound: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
+            P("Alert sound: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.alertSound
     )
 
-    -- Sound picker label + dropdown + preview button
-    local soundLabel = ac:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    soundLabel:SetPoint("TOPLEFT", ac, "TOPLEFT", 22, -268)
-    soundLabel:SetText("|cFFBBBBBBSound:|r")
-
-    local soundDropdown = CreateFrame("Frame", "WTFAYSoundDropdownStandalone", ac, "UIDropDownMenuTemplate")
-    soundDropdown:SetPoint("LEFT", soundLabel, "RIGHT", -8, -2)
-    UIDropDownMenu_SetWidth(soundDropdown, 130)
-
-    local function SoundDropdown_Init(self, level)
-        for i, s in ipairs(ALERT_SOUNDS) do
-            local info = UIDropDownMenu_CreateInfo()
-            info.text = s.name
-            info.value = i
-            info.func = function()
-                if db and db.settings then db.settings.alertSoundChoice = i end
-                UIDropDownMenu_SetSelectedValue(soundDropdown, i)
-                UIDropDownMenu_SetText(soundDropdown, s.name)
-                PlaySound(s.normal)
-            end
-            info.checked = (db and db.settings and db.settings.alertSoundChoice == i)
-            UIDropDownMenu_AddButton(info, level)
-        end
-    end
-    UIDropDownMenu_Initialize(soundDropdown, SoundDropdown_Init)
-
-    local previewBtn = CreateFrame("Button", nil, ac, "UIPanelButtonTemplate")
-    previewBtn:SetSize(40, 22)
-    previewBtn:SetPoint("LEFT", soundDropdown, "RIGHT", -4, 2)
-    previewBtn:SetText("Test")
-    previewBtn:SetScript("OnClick", function()
-        local idx = db and db.settings and db.settings.alertSoundChoice or 1
-        local choice = ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]
-        PlaySound(choice.normal)
-    end)
-    previewBtn:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText("Preview sound")
-        GameTooltip:Show()
-    end)
-    previewBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    -- Sound picker (shared builder, also used by the game's AddOns menu)
+    local soundRefresh = settingsPanel.BuildSoundPicker(ac, -268)
+    RecordCustom("Alerts", 44, settingsPanel.BuildSoundPicker)
 
     local skipGuildToggle = CreateToggle(ac, -304,
         "Skip Guild Members in Alerts",
@@ -1812,8 +2175,8 @@ do
         function() return db and db.settings and db.settings.alertSkipGuild or false end,
         function(val)
             if db and db.settings then db.settings.alertSkipGuild = val end
-            P("Skip guild in alerts: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
+            P("Skip guild in alerts: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.alertSkipGuild
     )
 
     ----------------------------------------------------------------
@@ -1828,22 +2191,58 @@ do
         function(val)
             if db then db.minimapHidden = not val end
             if val then minimapBtn:Show() else minimapBtn:Hide() end
-            P("Minimap button: " .. (val and "|cFF44FF44shown|r" or "|cFFFF4444hidden|r"))
-        end
+            P("Minimap button: " .. (val and T.on .. "shown|r" or T.off .. "hidden|r"))
+        end, true
     )
 
+    local tooltipToggle = CreateToggle(dc, -60,
+        "Show Info on Tooltips",
+        "Add rating, note, and last-seen info to the tooltip of players you've tracked.",
+        function() return db and db.settings and db.settings.tooltipEnabled or false end,
+        function(val)
+            if db and db.settings then db.settings.tooltipEnabled = val end
+            P("Tooltip info: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.tooltipEnabled
+    )
+
+    local tooltipGuildToggle = CreateToggle(dc, -110,
+        "  Include Guild",
+        "Also show the player's guild on the tooltip when it's known.",
+        function() return db and db.settings and db.settings.tooltipGuild or false end,
+        function(val)
+            if db and db.settings then db.settings.tooltipGuild = val end
+            P("Tooltip guild: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.tooltipGuild
+    )
+
+    local tooltipHintToggle = CreateToggle(dc, -160,
+        "  Hint on Unknown Players",
+        "Show a \"/wtfay target to track\" reminder on players you haven't tracked yet.",
+        function() return db and db.settings and db.settings.tooltipHint or false end,
+        function(val)
+            if db and db.settings then db.settings.tooltipHint = val end
+            P("Tooltip hint: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.tooltipHint
+    )
+
+    -- Window style (shared builder; Mainline only)
+    local skinRefresh = settingsPanel.BuildSkinPicker(dc, -216)
+    if skinRefresh then RecordCustom("Display", 40, settingsPanel.BuildSkinPicker) end
+
     ----------------------------------------------------------------
-    -- Common: About + Done (always visible)
+    -- Settings footer replaces the database actions while this tab is open.
     ----------------------------------------------------------------
     local aboutLabel = sp:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    aboutLabel:SetPoint("BOTTOM", sp, "BOTTOM", 0, 38)
-    aboutLabel:SetText("|cFF888888v" .. ADDON_VERSION .. "  -  Developed by |r|cFF" .. ACCENT .. "goosefraba|r")
+    aboutLabel:SetPoint("BOTTOMRIGHT", sp, "BOTTOMRIGHT", -4, 8)
+    aboutLabel:SetText(T.dim .. "v" .. ADDON_VERSION .. "  -  Developed by |r|cFF" .. ACCENT .. "goosefraba|r")
 
-    local doneBtn = CreateFrame("Button", nil, sp, "UIPanelButtonTemplate")
-    doneBtn:SetSize(80, 22)
-    doneBtn:SetPoint("BOTTOM", sp, "BOTTOM", 0, 12)
-    doneBtn:SetText("Done")
-    doneBtn:SetScript("OnClick", function() sp:Hide() end)
+    local doneBtn = CreateFrame("Button", nil, sp, C.ButtonTemplate)
+    doneBtn:SetSize(100, 22)
+    doneBtn:SetPoint("BOTTOMLEFT", sp, "BOTTOMLEFT", 0, 2)
+    doneBtn:SetText("Back")
+    doneBtn:SetScript("OnClick", function()
+        ShowMainTab(settingsPanel.returnTab or "Database")
+    end)
 
     -- Refresh all toggles when shown
     sp:SetScript("OnShow", function()
@@ -1857,23 +2256,84 @@ do
         alertSoundToggle.Refresh()
         skipGuildToggle.Refresh()
         minimapToggle.Refresh()
-        local idx = db and db.settings and db.settings.alertSoundChoice or 1
-        UIDropDownMenu_SetSelectedValue(soundDropdown, idx)
-        UIDropDownMenu_SetText(soundDropdown, (ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]).name)
+        whoEnrichToggle.Refresh()
+        unitMenuToggle.Refresh()
+        tooltipToggle.Refresh()
+        tooltipGuildToggle.Refresh()
+        tooltipHintToggle.Refresh()
+        if skinRefresh then skinRefresh() end
+        if soundRefresh then soundRefresh() end
         ShowTab(activeTab)
     end)
 
     -- Public interface
     settingsPanel.Toggle = function()
-        if sp:IsShown() then sp:Hide() else sp:Show() end
+        if f:IsShown() and activeMainTab == "Settings" then
+            ShowMainTab(settingsPanel.returnTab or "Database")
+        else
+            ShowMainTab("Settings")
+            f:Show()
+        end
     end
-    settingsPanel.frame = sp
 
     -- Initialize default tab
     ShowTab("General")
 end
 
 D("settings panel OK")
+
+----------------------------------------------------------------------
+-- Main window layout per skin
+--
+-- In the native skin Database/Inbox/Settings become bottom tabs, which frees the pill
+-- row under the title bar, so everything below moves up into it. The original
+-- anchors are captured once and re-applied with an offset, never accumulated,
+-- so switching skins back and forth is exact.
+----------------------------------------------------------------------
+do  -- block-scoped: these helpers spend no file-scope locals (Lua 5.1 caps a scope at 200)
+local MAIN_TOP_SHIFT = 22
+local mainLayoutBase   -- widget -> its original points
+
+local function ApplyMainLayout()
+    local widgets = { searchBox, sourcePills[1], groupFilterPill, countLabel, headerBar, inboxContent, settingsPanel.frame }
+    if not mainLayoutBase then
+        mainLayoutBase = {}
+        for _, w in ipairs(widgets) do
+            if w then
+                local pts = {}
+                for i = 1, w:GetNumPoints() do pts[i] = { w:GetPoint(i) } end
+                mainLayoutBase[w] = pts
+            end
+        end
+    end
+
+    local useNative = (nativeMainTabs ~= nil) and C.IsNativeWindow(f)
+    local shift = useNative and MAIN_TOP_SHIFT or 0
+
+    for _, btn in pairs(mainTabButtons) do btn:SetShown(not useNative) end
+    if nativeMainTabs then
+        for _, tab in ipairs(nativeMainTabs) do tab:SetShown(useNative) end
+    end
+
+    for w, pts in pairs(mainLayoutBase) do
+        w:ClearAllPoints()
+        for _, pt in ipairs(pts) do
+            local point, rel, relPoint, x, y = pt[1], pt[2], pt[3], pt[4], pt[5]
+            -- The search box no longer needs room for its "Search:" label once
+            -- the native search field (magnifier + placeholder) replaces it.
+            if w == searchBox and C.HasSearchBox and rel == f then x = 16 end
+            if rel == f and type(relPoint) == "string" and relPoint:find("^TOP") then
+                y = (y or 0) + shift
+            end
+            w:SetPoint(point, rel, relPoint, x, y)
+        end
+    end
+end
+
+C.OnSkinChanged(ApplyMainLayout)
+ApplyMainLayout()
+end
+
 
 ----------------------------------------------------------------------
 -- Blizzard Interface Options panel (AddOns tab)
@@ -1885,7 +2345,7 @@ do
     -- Title
     local optTitle = optPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
     optTitle:SetPoint("TOPLEFT", 16, -16)
-    optTitle:SetText("|cFF" .. ACCENT .. "WTFAY|r - Who The F* Are You?  |cFF888888v" .. ADDON_VERSION .. "|r")
+    optTitle:SetText("|cFF" .. ACCENT .. "WTFAY|r - Who The F* Are You?  " .. T.dim .. "v" .. ADDON_VERSION .. "|r")
 
     -- Subtitle
     local optSub = optPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -1893,15 +2353,11 @@ do
     optSub:SetText("Track, rate, and remember every player you group with.")
 
     -- Helper: checkbox for Blizzard panel
-    local function BlizCheckbox(parent, yOffset, label, description, getter, setter)
-        local cb = CreateFrame("CheckButton", nil, parent)
+    local function BlizCheckbox(parent, yOffset, label, description, getter, setter, default)
+        local cb = C.CreateCheckbox(parent)
         cb:SetSize(26, 26)
         cb:SetPoint("TOPLEFT", parent, "TOPLEFT", 16, yOffset)
 
-        cb:SetNormalTexture("Interface\\Buttons\\UI-CheckBox-Up")
-        cb:SetPushedTexture("Interface\\Buttons\\UI-CheckBox-Down")
-        cb:SetHighlightTexture("Interface\\Buttons\\UI-CheckBox-Highlight", "ADD")
-        cb:SetCheckedTexture("Interface\\Buttons\\UI-CheckBox-Check")
 
         local lbl = cb:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         lbl:SetPoint("LEFT", cb, "RIGHT", 4, 1)
@@ -1914,10 +2370,7 @@ do
         desc:SetText(description)
         desc:SetWordWrap(true)
 
-        cb:SetScript("OnClick", function(self)
-            local val = self:GetChecked() and true or false
-            setter(val)
-        end)
+        C.BindToggle(cb, label, description, setter, default)
 
         cb.Refresh = function()
             cb:SetChecked(getter())
@@ -1926,228 +2379,93 @@ do
         return cb
     end
 
-    -- Debug toggle
-    local optDebug = BlizCheckbox(optPanel, -60,
-        "Debug Logging",
-        "Show verbose [WTFAY-DBG] messages in chat. Useful for troubleshooting.",
-        function() return DEBUG end,
-        function(val)
-            DEBUG = val
-            if db and db.settings then db.settings.debug = val end
-            P("Debug mode: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+    -- Open the player browser straight from the game's AddOns menu.
+    local optOpenBtn = CreateFrame("Button", nil, optPanel, C.ButtonTemplate)
+    optOpenBtn:SetSize(130, 22)
+    optOpenBtn:SetPoint("TOPRIGHT", optPanel, "TOPRIGHT", -16, -16)
+    optOpenBtn:SetText("Open WTFAY")
+    optOpenBtn:SetScript("OnClick", function() f:Show() end)
+
+    ----------------------------------------------------------------
+    -- Every setting, generated from settingsPanel.spec
+    --
+    -- This page used to be hand-written alongside /wtfay settings and had
+    -- quietly fallen behind it (no tooltip, /who, menu-entry or window-style
+    -- options). It now replays whatever the Settings tab recorded, in
+    -- the same sections and order, so the two can't drift again.
+    ----------------------------------------------------------------
+    local optScroll = CreateFrame("ScrollFrame", "WTFAYOptionsScroll", optPanel, "UIPanelScrollFrameTemplate")
+    optScroll:SetPoint("TOPLEFT", optPanel, "TOPLEFT", 4, -64)
+    optScroll:SetPoint("BOTTOMRIGHT", optPanel, "BOTTOMRIGHT", -30, 40)
+
+    local optBody = CreateFrame("Frame", nil, optScroll)
+    optBody:SetSize(560, 10)
+    optScroll:SetScrollChild(optBody)
+    -- Descriptions wrap against the body's width, which only exists once the
+    -- game has sized its Settings canvas.
+    optScroll:SetScript("OnSizeChanged", function(_, w)
+        if w and w > 0 then optBody:SetWidth(w) end
+    end)
+
+    local SECTION_TITLES = { General = "General", Alerts = "Known Player Alerts", Display = "Display" }
+    local optRefreshers = {}
+    local y, lastSection = -4, nil
+    for _, e in ipairs(settingsPanel.spec) do
+        if e.section ~= lastSection then
+            if lastSection then y = y - 12 end
+            local h = optBody:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+            h:SetPoint("TOPLEFT", optBody, "TOPLEFT", 12, y)
+            h:SetText(SECTION_TITLES[e.section] or e.section)
+            local rule = optBody:CreateTexture(nil, "ARTWORK")
+            rule:SetColorTexture(unpack(C.Theme.sep))
+            rule:SetHeight(1)
+            rule:SetPoint("TOPLEFT", h, "BOTTOMLEFT", 0, -4)
+            rule:SetPoint("RIGHT", optBody, "RIGHT", -16, 0)
+            y = y - 32
+            lastSection = e.section
         end
-    )
-
-    -- Auto-track toggle
-    local optAutoTrack = BlizCheckbox(optPanel, -110,
-        "Auto-Track Party Members",
-        "Automatically add or update players when you join a party, raid, or dungeon.",
-        function() return db and db.settings and db.settings.autoTrack or false end,
-        function(val)
-            if db and db.settings then db.settings.autoTrack = val end
-            P("Auto-tracking: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
-    )
-
-    -- Known player alerts toggle (master)
-    local optKnownAlerts = BlizCheckbox(optPanel, -160,
-        "Known Player Alerts",
-        "Master toggle for all known player notifications.",
-        function() return db and db.settings and db.settings.knownAlerts or false end,
-        function(val)
-            if db and db.settings then db.settings.knownAlerts = val end
-            P("Known player alerts: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
-    )
-
-    -- Sub-toggle: Player Joins
-    local optAlertJoin = BlizCheckbox(optPanel, -198,
-        "  Player Joins",
-        "Alert when a known player joins your group.",
-        function() return db and db.settings and db.settings.alertOnJoin or false end,
-        function(val)
-            if db and db.settings then db.settings.alertOnJoin = val end
-            P("Alert on join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
-    )
-
-    -- Sub-toggle: Player Leaves
-    local optAlertLeave = BlizCheckbox(optPanel, -236,
-        "  Player Leaves",
-        "Alert when a known player leaves your group.",
-        function() return db and db.settings and db.settings.alertOnLeave or false end,
-        function(val)
-            if db and db.settings then db.settings.alertOnLeave = val end
-            P("Alert on leave: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
-    )
-
-    -- Sub-toggle: I Join Group
-    local optAlertMeJoin = BlizCheckbox(optPanel, -274,
-        "  I Join a Group",
-        "Alert when you join a group with known players already in it.",
-        function() return db and db.settings and db.settings.alertOnMeJoin or false end,
-        function(val)
-            if db and db.settings then db.settings.alertOnMeJoin = val end
-            P("Alert on me join: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
-    )
-
-    -- Alert popup toggle
-    local optAlertPopup = BlizCheckbox(optPanel, -324,
-        "Alert Popup Panel",
-        "Also show a popup panel with known players (not just chat).",
-        function() return db and db.settings and db.settings.alertPopup or false end,
-        function(val)
-            if db and db.settings then db.settings.alertPopup = val end
-            P("Alert popup: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
-    )
-
-    -- Alert sound toggle
-    local optAlertSound = BlizCheckbox(optPanel, -374,
-        "Alert Sound",
-        "Play a sound when the known player alert appears.",
-        function() return db and db.settings and db.settings.alertSound or false end,
-        function(val)
-            if db and db.settings then db.settings.alertSound = val end
-            P("Alert sound: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
-    )
-
-    -- Sound picker dropdown (Blizzard panel)
-    local optSoundLabel = optPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    optSoundLabel:SetPoint("TOPLEFT", optPanel, "TOPLEFT", 22, -418)
-    optSoundLabel:SetText("Sound:")
-
-    local optSoundDropdown = CreateFrame("Frame", "WTFAYSoundDropdownBliz", optPanel, "UIDropDownMenuTemplate")
-    optSoundDropdown:SetPoint("LEFT", optSoundLabel, "RIGHT", -8, -2)
-    UIDropDownMenu_SetWidth(optSoundDropdown, 130)
-
-    local function OptSoundDropdown_Init(self, level)
-        for i, s in ipairs(ALERT_SOUNDS) do
-            local info = UIDropDownMenu_CreateInfo()
-            info.text = s.name
-            info.value = i
-            info.func = function()
-                if db and db.settings then db.settings.alertSoundChoice = i end
-                UIDropDownMenu_SetSelectedValue(optSoundDropdown, i)
-                UIDropDownMenu_SetText(optSoundDropdown, s.name)
-                PlaySound(s.normal)
-            end
-            info.checked = (db and db.settings and db.settings.alertSoundChoice == i)
-            UIDropDownMenu_AddButton(info, level)
+        if e.kind == "toggle" then
+            local cb = BlizCheckbox(optBody, y, e.label, e.description, e.getter, e.setter, e.default)
+            optRefreshers[#optRefreshers + 1] = cb.Refresh
+            -- Indented sub-options ("  Player Joins") sit closer together.
+            y = y - (((e.label or ""):find("^%s")) and 40 or 48)
+        elseif e.kind == "custom" then
+            local refresh = e.build(optBody, y)
+            if refresh then optRefreshers[#optRefreshers + 1] = refresh end
+            y = y - (e.height or 40)
         end
     end
-    UIDropDownMenu_Initialize(optSoundDropdown, OptSoundDropdown_Init)
-
-    local optPreviewBtn = CreateFrame("Button", nil, optPanel, "UIPanelButtonTemplate")
-    optPreviewBtn:SetSize(40, 22)
-    optPreviewBtn:SetPoint("LEFT", optSoundDropdown, "RIGHT", -4, 2)
-    optPreviewBtn:SetText("Test")
-    optPreviewBtn:SetScript("OnClick", function()
-        local idx = db and db.settings and db.settings.alertSoundChoice or 1
-        local choice = ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]
-        PlaySound(choice.normal)
-    end)
-    optPreviewBtn:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText("Preview sound")
-        GameTooltip:Show()
-    end)
-    optPreviewBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-    -- Skip guild toggle
-    local optSkipGuild = BlizCheckbox(optPanel, -462,
-        "Skip Guild Members in Alerts",
-        "Don't show alerts for players in your guild.",
-        function() return db and db.settings and db.settings.alertSkipGuild or false end,
-        function(val)
-            if db and db.settings then db.settings.alertSkipGuild = val end
-            P("Skip guild in alerts: " .. (val and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
-        end
-    )
-
-    -- Minimap button toggle
-    local optMinimap = BlizCheckbox(optPanel, -512,
-        "Minimap Button",
-        "Show the WTFAY icon on your minimap for quick access.",
-        function() return not (db and db.minimapHidden) end,
-        function(val)
-            if db then db.minimapHidden = not val end
-            if val then minimapBtn:Show() else minimapBtn:Hide() end
-            P("Minimap button: " .. (val and "|cFF44FF44shown|r" or "|cFFFF4444hidden|r"))
-        end
-    )
+    optBody:SetHeight(-y + 16)
 
     -- About / credit
     local optAbout = optPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    optAbout:SetPoint("BOTTOMLEFT", optPanel, "BOTTOMLEFT", 16, 32)
-    optAbout:SetText("|cFF888888v" .. ADDON_VERSION .. "  -  Developed by |r|cFF" .. ACCENT .. "goosefraba|r")
+    optAbout:SetPoint("BOTTOMLEFT", optPanel, "BOTTOMLEFT", 16, 22)
+    optAbout:SetText(T.dim .. "v" .. ADDON_VERSION .. "  -  Developed by |r|cFF" .. ACCENT .. "goosefraba|r")
 
-    -- Info text at the bottom
     local optInfo = optPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    optInfo:SetPoint("BOTTOMLEFT", optPanel, "BOTTOMLEFT", 16, 16)
-    optInfo:SetText("|cFF888888Type /wtfay to open the player browser.  /wtfay help for all commands.|r")
+    optInfo:SetPoint("BOTTOMLEFT", optPanel, "BOTTOMLEFT", 16, 8)
+    optInfo:SetText(T.dim .. "The same settings as /wtfay settings. Hover an option for details; right-click to reset it.|r")
 
-    -- Refresh checkboxes when panel is shown
     optPanel:SetScript("OnShow", function()
-        optDebug.Refresh()
-        optAutoTrack.Refresh()
-        optKnownAlerts.Refresh()
-        optAlertJoin.Refresh()
-        optAlertLeave.Refresh()
-        optAlertMeJoin.Refresh()
-        optAlertPopup.Refresh()
-        optAlertSound.Refresh()
-        optSkipGuild.Refresh()
-        optMinimap.Refresh()
-        -- Refresh sound dropdown
-        local idx = db and db.settings and db.settings.alertSoundChoice or 1
-        UIDropDownMenu_SetSelectedValue(optSoundDropdown, idx)
-        UIDropDownMenu_SetText(optSoundDropdown, (ALERT_SOUNDS[idx] or ALERT_SOUNDS[1]).name)
+        for _, refresh in ipairs(optRefreshers) do refresh() end
     end)
 
     -- Store reference; registration happens in PLAYER_LOGIN to ensure Blizzard UI is fully ready
     settingsPanel.blizPanel = optPanel
+    ns.optionsPanel = optPanel      -- compat layer needs it for the legacy open path
+
     settingsPanel.RegisterBliz = function()
-        D("RegisterBliz called")
-        D("InterfaceOptions_AddCategory exists: " .. tostring(InterfaceOptions_AddCategory ~= nil))
-        D("optPanel.name = " .. tostring(optPanel.name))
-        D("optPanel type = " .. tostring(type(optPanel)))
-
-        if not InterfaceOptions_AddCategory then
-            D("InterfaceOptions_AddCategory does not exist! Trying Settings.RegisterAddOnCategory...")
-            -- Retail / newer API fallback
-            if Settings and Settings.RegisterAddOnCategory then
-                local category = Settings.RegisterCanvasLayoutCategory(optPanel, optPanel.name)
-                if category then
-                    Settings.RegisterAddOnCategory(category)
-                    D("Registered via Settings API")
-                end
-            else
-                D("No options registration API found.")
-            end
-            return
-        end
-
-        local regOK, regErr = pcall(function()
-            InterfaceOptions_AddCategory(optPanel)
-        end)
-        D("InterfaceOptions_AddCategory: ok=" .. tostring(regOK) .. " err=" .. tostring(regErr))
-        if not regOK then
-            D("Will not be visible in Interface Options. Using standalone panel instead.")
+        -- Settings.* on Mainline, InterfaceOptions_AddCategory on Classic.
+        local ok, err = C.RegisterOptions(optPanel, optPanel.name)
+        D("RegisterOptions: ok=" .. tostring(ok) .. " err=" .. tostring(err))
+        if not ok then
+            D("Not visible in the game options; the Settings tab still works.")
         end
     end
+
     settingsPanel.OpenBliz = function()
-        local ok, err = pcall(function()
-            InterfaceOptionsFrame_OpenToCategory(optPanel)
-            -- Need to call twice in some versions due to a Blizzard bug
-            InterfaceOptionsFrame_OpenToCategory(optPanel)
-        end)
-        if not ok then
-            D("OpenBliz error: " .. tostring(err))
-            -- Fallback: open standalone panel
+        if not C.OpenOptions() then
+            -- Nothing to open (or the API refused) - fall back to our own panel.
             settingsPanel.Toggle()
         end
     end
@@ -2213,10 +2531,11 @@ end)
 -- Left-click: toggle WTFAY. Right-click: toggle settings.
 minimapBtn:SetScript("OnClick", function(self, button)
     if button == "RightButton" then
-        if settingsPanel and settingsPanel.OpenBliz then
-            settingsPanel.OpenBliz()
-        elseif settingsPanel and settingsPanel.Toggle then
+        -- Open the Settings tab in the main window.
+        if settingsPanel and settingsPanel.Toggle then
             settingsPanel.Toggle()
+        elseif settingsPanel and settingsPanel.OpenBliz then
+            settingsPanel.OpenBliz()
         end
     else
         if f:IsShown() then f:Hide() else f:Show() end
@@ -2244,7 +2563,7 @@ local helpPanel
 ----------------------------------------------------------------------
 -- Bottom bar
 ----------------------------------------------------------------------
-local addBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+local addBtn = CreateFrame("Button", nil, f, C.ButtonTemplate)
 addBtn:SetSize(100, 22)
 addBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 12, 12)
 addBtn:SetText("Add Target")
@@ -2252,27 +2571,15 @@ addBtn:SetScript("OnClick", function()
     AddTargetPlayer()
 end)
 
-local settingsBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-settingsBtn:SetSize(70, 22)
-settingsBtn:SetPoint("LEFT", addBtn, "RIGHT", 4, 0)
-settingsBtn:SetText("Settings")
-settingsBtn:SetScript("OnClick", function()
-    if settingsPanel.OpenBliz then
-        settingsPanel.OpenBliz()
-    else
-        settingsPanel.Toggle()
-    end
-end)
-
-local exportBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+local exportBtn = CreateFrame("Button", nil, f, C.ButtonTemplate)
 exportBtn:SetSize(60, 22)
-exportBtn:SetPoint("LEFT", settingsBtn, "RIGHT", 4, 0)
+exportBtn:SetPoint("LEFT", addBtn, "RIGHT", 4, 0)
 exportBtn:SetText("Export")
 exportBtn:SetScript("OnClick", function()
     if importExportPanel.ShowExport then importExportPanel.ShowExport() end
 end)
 
-local importBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+local importBtn = CreateFrame("Button", nil, f, C.ButtonTemplate)
 importBtn:SetSize(60, 22)
 importBtn:SetPoint("LEFT", exportBtn, "RIGHT", 4, 0)
 importBtn:SetText("Import")
@@ -2280,7 +2587,7 @@ importBtn:SetScript("OnClick", function()
     if importExportPanel.ShowImport then importExportPanel.ShowImport() end
 end)
 
-local statsBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+local statsBtn = CreateFrame("Button", nil, f, C.ButtonTemplate)
 statsBtn:SetSize(50, 22)
 statsBtn:SetPoint("LEFT", importBtn, "RIGHT", 4, 0)
 statsBtn:SetText("Stats")
@@ -2288,13 +2595,15 @@ statsBtn:SetScript("OnClick", function()
     if statsPanel and statsPanel.Toggle then statsPanel.Toggle() end
 end)
 
-local helpBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+local helpBtn = CreateFrame("Button", nil, f, C.ButtonTemplate)
 helpBtn:SetSize(50, 22)
 helpBtn:SetPoint("LEFT", statsBtn, "RIGHT", 4, 0)
 helpBtn:SetText("Help")
 helpBtn:SetScript("OnClick", function()
     if helpPanel and helpPanel.Toggle then helpPanel.Toggle() end
 end)
+
+settingsPanel.mainButtons = { addBtn, exportBtn, importBtn, statsBtn, helpBtn }
 
 D("bottom bar OK")
 
@@ -2380,6 +2689,14 @@ do
                     local seen    = UnescField(parts[10])
 
                     if key ~= "" and name ~= "" then
+                        -- Recompute rather than trusting the file's key, so an
+                        -- export from an older build (or from a realm whose
+                        -- name contains a dash or space) lands on the same
+                        -- normalized key the rest of the addon uses.
+                        if realm ~= "" then
+                            realm = NormalizeRealm(realm)
+                            key   = MakeKey(name, realm)
+                        end
                         if db.players[key] then
                             -- Merge: keep higher absolute rating, append note if different
                             local existing = db.players[key]
@@ -2428,7 +2745,7 @@ do
     end
 
     -- Export panel: scrollable editbox with select-all
-    local expFrame = CreateFrame("Frame", "WTFAYExportFrame", UIParent)
+    local expFrame = C.CreateWindow("WTFAYExportFrame", UIParent)
     expFrame:SetSize(500, 350)
     expFrame:SetPoint("CENTER")
     expFrame:SetFrameStrata("FULLSCREEN_DIALOG")
@@ -2441,15 +2758,7 @@ do
     expFrame:Hide()
 
     if BackdropTemplateMixin then Mixin(expFrame, BackdropTemplateMixin); expFrame:OnBackdropLoaded() end
-    if expFrame.SetBackdrop then
-        expFrame:SetBackdrop({
-            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-            tile = true, tileSize = 32, edgeSize = 24,
-            insets = { left = 6, right = 6, top = 6, bottom = 6 },
-        })
-        expFrame:SetBackdropColor(0.05, 0.05, 0.08, 0.96)
-    end
+    -- Chrome: C.SkinWindow below, once title and close button exist.
 
     do local nm = expFrame:GetName(); if nm then tinsert(UISpecialFrames, nm) end end
 
@@ -2458,6 +2767,7 @@ do
 
     local expTitle = expFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     expTitle:SetPoint("TOP", 0, -14)
+    C.SkinWindow(expFrame, { title = expTitle, close = expClose, edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
 
     local expHint = expFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     expHint:SetPoint("TOP", expTitle, "BOTTOM", 0, -4)
@@ -2476,25 +2786,25 @@ do
     expScroll:SetScrollChild(expEditBox)
 
     -- Bottom buttons: Close (default), Merge + Replace (import mode)
-    local btnClose = CreateFrame("Button", nil, expFrame, "UIPanelButtonTemplate")
+    local btnClose = CreateFrame("Button", nil, expFrame, C.ButtonTemplate)
     btnClose:SetSize(80, 22)
     btnClose:SetPoint("BOTTOM", 0, 12)
     btnClose:SetText("Close")
     btnClose:SetScript("OnClick", function() expFrame:Hide() end)
 
-    local btnMerge = CreateFrame("Button", nil, expFrame, "UIPanelButtonTemplate")
+    local btnMerge = CreateFrame("Button", nil, expFrame, C.ButtonTemplate)
     btnMerge:SetSize(100, 22)
     btnMerge:SetPoint("BOTTOMLEFT", expFrame, "BOTTOMLEFT", 60, 12)
     btnMerge:SetText("Merge")
     btnMerge:Hide()
 
-    local btnReplace = CreateFrame("Button", nil, expFrame, "UIPanelButtonTemplate")
+    local btnReplace = CreateFrame("Button", nil, expFrame, C.ButtonTemplate)
     btnReplace:SetSize(100, 22)
     btnReplace:SetPoint("LEFT", btnMerge, "RIGHT", 8, 0)
-    btnReplace:SetText("|cFFFF6666Replace All|r")
+    btnReplace:SetText(T.dangerSoft .. "Replace All|r")
     btnReplace:Hide()
 
-    local btnCancel = CreateFrame("Button", nil, expFrame, "UIPanelButtonTemplate")
+    local btnCancel = CreateFrame("Button", nil, expFrame, C.ButtonTemplate)
     btnCancel:SetSize(80, 22)
     btnCancel:SetPoint("LEFT", btnReplace, "RIGHT", 8, 0)
     btnCancel:SetText("Cancel")
@@ -2510,7 +2820,7 @@ do
     -- Public show functions
     importExportPanel.ShowExport = function()
         expTitle:SetText("|cFF" .. ACCENT .. "Export WTFAY Database|r")
-        expHint:SetText("|cFF888888Select all (Ctrl+A), copy (Ctrl+C), and share with a friend.|r")
+        expHint:SetText(T.dim .. "Select all (Ctrl+A), copy (Ctrl+C), and share with a friend.|r")
         expEditBox:SetText(ExportDB())
         expEditBox:SetCursorPosition(0)
         ResetButtons()
@@ -2521,7 +2831,7 @@ do
 
     importExportPanel.ShowImport = function()
         expTitle:SetText("|cFF" .. ACCENT .. "Import WTFAY Database|r")
-        expHint:SetText("|cFF888888Paste exported data below. Merge adds new + updates existing. Replace overwrites everything.|r")
+        expHint:SetText(T.dim .. "Paste exported data below. Merge adds new + updates existing. Replace overwrites everything.|r")
         expEditBox:SetText("")
 
         -- Show import buttons, hide close
@@ -2534,7 +2844,7 @@ do
             local text = expEditBox:GetText()
             if text == "" then P("Nothing to import."); expFrame:Hide(); ResetButtons(); return end
             local added, updated = ImportDB(text)
-            P("Merge complete: |cFF44FF44" .. added .. " added|r, |cFFFFCC44" .. updated .. " updated|r")
+            P("Merge complete: " .. T.on .. added .. " added|r, " .. T.manual .. updated .. " updated|r")
             RefreshList()
             expFrame:Hide()
             ResetButtons()
@@ -2573,11 +2883,11 @@ do
             while #db.backups > 3 do
                 table.remove(db.backups)
             end
-            P("Backup created (" .. backupCount .. " players saved). Use |cFFFFD100/wtfay restore|r to undo.")
+            P("Backup created (" .. backupCount .. " players saved). Use " .. T.gold .. "/wtfay restore|r to undo.")
             -- Wipe existing data and import fresh
             wipe(db.players)
             local added, _ = ImportDB(text)
-            P("Replace complete: |cFF44FF44" .. added .. " players|r imported (old data wiped)")
+            P("Replace complete: " .. T.on .. added .. " players|r imported (old data wiped)")
             RefreshList()
             expFrame:Hide()
             ResetButtons()
@@ -2601,7 +2911,7 @@ D("import/export OK")
 statsPanel = {}
 
 do
-    local sp = CreateFrame("Frame", "WTFAYStatsPanel", UIParent)
+    local sp = C.CreateWindow("WTFAYStatsPanel", UIParent)
     sp:SetSize(320, 380)
     sp:SetPoint("CENTER", UIParent, "CENTER", 0, 60)
     sp:SetFrameStrata("FULLSCREEN_DIALOG")
@@ -2617,15 +2927,7 @@ do
         Mixin(sp, BackdropTemplateMixin)
         sp:OnBackdropLoaded()
     end
-    if sp.SetBackdrop then
-        sp:SetBackdrop({
-            bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-            tile = true, tileSize = 32, edgeSize = 24,
-            insets = { left = 6, right = 6, top = 6, bottom = 6 },
-        })
-        sp:SetBackdropColor(0.05, 0.05, 0.08, 0.96)
-    end
+    -- Chrome: C.SkinWindow below, once title and close button exist.
 
     -- Close on Escape
     do
@@ -2640,6 +2942,7 @@ do
     -- Title
     local spTitle = sp:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     spTitle:SetPoint("TOP", sp, "TOP", 0, -14)
+    C.SkinWindow(sp, { title = spTitle, close = spClose, edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
     spTitle:SetText("|cFF" .. ACCENT .. "WTFAY Database Stats|r")
 
     -- Content area: we create font strings for each stat line
@@ -2672,13 +2975,13 @@ do
     local lineManual         = AddLine(-290)
     local lineEncounters     = AddLine(-312)
 
-    lineSep1:SetText("|cFF444444———————————————————————|r")
-    lineSep2:SetText("|cFF444444———————————————————————|r")
+    lineSep1:SetText(T.dark .. "———————————————————————|r")
+    lineSep2:SetText(T.dark .. "———————————————————————|r")
 
     -- Helper: colored count bar
     local function StatLine(label, count, total, color)
         local pct = total > 0 and math.floor(count / total * 100) or 0
-        return "|cFF" .. color .. label .. "|r  |cFFFFFFFF" .. count .. "|r  |cFF888888(" .. pct .. "%)|r"
+        return "|cFF" .. color .. label .. "|r  " .. T.white .. count .. "|r  " .. T.dim .. "(" .. pct .. "%)|r"
     end
 
     -- Refresh stats on show
@@ -2731,8 +3034,8 @@ do
         local avgRating = totalPlayers > 0 and (ratingSum / totalPlayers) or 0
         local avgStr = string.format("%.1f", avgRating)
 
-        lineTotalPlayers:SetText("|cFFFFFFFFTotal Players:|r  |cFF" .. ACCENT .. totalPlayers .. "|r")
-        lineAvgRating:SetText("|cFFFFFFFFAverage Rating:|r  " .. ColorRating(math.floor(avgRating + 0.5)) .. " |cFF888888(" .. avgStr .. ")|r")
+        lineTotalPlayers:SetText(T.white .. "Total Players:|r  |cFF" .. ACCENT .. totalPlayers .. "|r")
+        lineAvgRating:SetText(T.white .. "Average Rating:|r  " .. C.RatingIcon(math.floor(avgRating + 0.5)) .. ColorRating(math.floor(avgRating + 0.5)) .. " " .. T.dim .. "(" .. avgStr .. ")|r")
 
         lineRatingHeader:SetText("|cFF" .. ACCENT .. "Rating Breakdown|r")
         lineBlacklist:SetText(StatLine("  Blacklist (-3)", countBlacklist, totalPlayers, "FF4444"))
@@ -2747,13 +3050,13 @@ do
         lineGroup:SetText(StatLine("  Group", countGroup, totalPlayers, "99FF66"))
         lineManual:SetText(StatLine("  Manual", countManual, totalPlayers, "FFCC44"))
 
-        lineEncounters:SetText("|cFFFFFFFFTotal Encounters:|r  |cFF" .. ACCENT .. totalEncounters .. "|r")
+        lineEncounters:SetText(T.white .. "Total Encounters:|r  |cFF" .. ACCENT .. totalEncounters .. "|r")
     end
 
     sp:SetScript("OnShow", RefreshStats)
 
     -- Done button
-    local doneBtn = CreateFrame("Button", nil, sp, "UIPanelButtonTemplate")
+    local doneBtn = CreateFrame("Button", nil, sp, C.ButtonTemplate)
     doneBtn:SetSize(80, 22)
     doneBtn:SetPoint("BOTTOM", sp, "BOTTOM", 0, 12)
     doneBtn:SetText("Close")
@@ -2774,7 +3077,7 @@ D("stats panel OK")
 helpPanel = {}
 
 do
-    local hp = CreateFrame("Frame", "WTFAYHelpPanel", UIParent)
+    local hp = C.CreateWindow("WTFAYHelpPanel", UIParent)
     hp:SetSize(440, 480)
     hp:SetPoint("CENTER", UIParent, "CENTER", 0, 40)
     hp:SetFrameStrata("FULLSCREEN_DIALOG")
@@ -2790,15 +3093,7 @@ do
         Mixin(hp, BackdropTemplateMixin)
         hp:OnBackdropLoaded()
     end
-    if hp.SetBackdrop then
-        hp:SetBackdrop({
-            bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-            tile = true, tileSize = 32, edgeSize = 24,
-            insets = { left = 6, right = 6, top = 6, bottom = 6 },
-        })
-        hp:SetBackdropColor(0.05, 0.05, 0.08, 0.96)
-    end
+    -- Chrome: C.SkinWindow below, once title and close button exist.
 
     -- Close on Escape
     do
@@ -2813,6 +3108,7 @@ do
     -- Title
     local hpTitle = hp:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     hpTitle:SetPoint("TOP", hp, "TOP", 0, -14)
+    C.SkinWindow(hp, { title = hpTitle, close = hpClose, edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
     hpTitle:SetText("|cFF" .. ACCENT .. "WTFAY Help & Guide|r")
 
     -- Scrollable content area
@@ -2838,81 +3134,81 @@ do
         "Rate them, leave notes, and never forget who you played with.",
         " ",
         "|cFF" .. ACCENT .. "--- Getting Started ---|r",
-        "Open the main panel by typing |cFFFFD100/wtfay|r or clicking the minimap icon.",
+        "Open the main panel by typing " .. T.gold .. "/wtfay|r or clicking the minimap icon.",
         "You can also bind it to a key or use a macro!",
         " ",
         "|cFF" .. ACCENT .. "--- Adding Players ---|r",
-        "The easiest way to add a player is to |cFFFFFFFFtarget them|r and click the",
-        "|cFFFFD100Add Target|r button, or type |cFFFFD100/wtfay target|r.",
+        "The easiest way to add a player is to " .. T.white .. "target them|r and click the",
+        T.gold .. "Add Target|r button, or type " .. T.gold .. "/wtfay target|r.",
         " ",
-        "|cFFFF8800Pro Tip:|r Create a macro for quick access:",
+        T.warn .. "Pro Tip:|r Create a macro for quick access:",
         " ",
-        "|cFF44FF44/run SlashCmdList[\"WTFAY\"](\"target\")|r",
+        T.on .. "/run SlashCmdList[\"WTFAY\"](\"target\")|r",
         " ",
         "Put this on your action bar and you can add any targeted player",
         "with a single click! Their name, class, race, and level are",
         "detected automatically.",
         " ",
         "You can also add players manually:",
-        "  |cFFFFD100/wtfay add Playername|r",
-        "  |cFFFFD100/wtfay add Playername-Realm|r",
+        "  " .. T.gold .. "/wtfay add Playername|r",
+        "  " .. T.gold .. "/wtfay add Playername-Realm|r",
         " ",
         "|cFF" .. ACCENT .. "--- Rating Players ---|r",
-        "Rate players from |cFFFF4444-3|r (blacklist) to |cFFFFD7005|r (legend):",
-        "  |cFFFF4444-3|r = Blacklisted  |cFFFF8844-2/-1|r = Negative",
-        "  |cFFCCCCCC 0|r = Neutral       |cFF44FF441-4|r = Positive",
-        "  |cFFFFD700 5|r = Legend",
+        "Rate players from " .. T.off .. "-3|r (blacklist) to " .. T.goldAlt .. "5|r (legend):",
+        "  " .. T.off .. "-3|r = Blacklisted  " .. T.ember .. "-2/-1|r = Negative",
+        "  " .. T.light .. " 0|r = Neutral       " .. T.on .. "1-4|r = Positive",
+        "  " .. T.goldAlt .. " 5|r = Legend",
         " ",
         "Click a player row, then use the rating stars in the detail view.",
-        "Or right-click a row and choose |cFFFFD100Set Rating|r.",
-        "Or via command: |cFFFFD100/wtfay rate Playername 3|r",
+        "Or right-click a row and choose " .. T.gold .. "Set Rating|r.",
+        "Or via command: " .. T.gold .. "/wtfay rate Playername 3|r",
         " ",
         "|cFF" .. ACCENT .. "--- Notes ---|r",
         "Add notes to remember specific details about a player.",
-        "Right-click a row and choose |cFFFFD100Edit Note|r,",
-        "or: |cFFFFD100/wtfay note Playername Great tank, marks targets|r",
+        "Right-click a row and choose " .. T.gold .. "Edit Note|r,",
+        "or: " .. T.gold .. "/wtfay note Playername Great tank, marks targets|r",
         " ",
         "|cFF" .. ACCENT .. "--- Browsing & Filtering ---|r",
         "The main panel has several tools at the top:",
-        "  |cFFFFFFFFSearch|r - Filter by player name",
-        "  |cFFFFFFFFRating filter|r - Show only certain ratings (click to cycle)",
-        "  |cFFFFFFFFSource filter|r - Show Raid / Dungeon / Group / Manual",
-        "  |cFFFFFFFFClass filter|r - Show only a specific class",
+        "  " .. T.white .. "Search|r - Filter by player name",
+        "  " .. T.white .. "Rating filter|r - Show only certain ratings (click to cycle)",
+        "  " .. T.white .. "Source filter|r - Show Raid / Dungeon / Group / Manual",
+        "  " .. T.white .. "Class filter|r - Show only a specific class",
         " ",
-        "All filters support |cFFFFD100left-click|r (forward) and |cFFFFD100right-click|r (backward).",
+        "All filters support " .. T.gold .. "left-click|r (forward) and " .. T.gold .. "right-click|r (backward).",
         " ",
-        "Click any |cFFFFFFFFcolumn header|r to sort. Click again to reverse.",
+        "Click any " .. T.white .. "column header|r to sort. Click again to reverse.",
         " ",
         "|cFF" .. ACCENT .. "--- Auto-Tracking ---|r",
         "When enabled (Settings), WTFAY automatically adds players you",
         "group with in parties, dungeons, and raids. Dungeon and raid",
         "encounters include the zone name. Toggle in Settings or:",
-        "  |cFFFFD100Interface > AddOns > WTFAY|r",
+        "  " .. T.gold .. "Interface > AddOns > WTFAY|r",
         " ",
         "|cFF" .. ACCENT .. "--- Import / Export ---|r",
         "Share your database with friends!",
-        "  |cFFFFD100Export|r - Copies your data as text. Send it to a friend.",
-        "  |cFFFFD100Import|r - Paste data from a friend.",
-        "    |cFFFFFFFFMerge|r keeps your existing data and adds new entries.",
-        "    |cFFFFFFFFReplace All|r wipes your data first (a backup is created).",
-        "  |cFFFFD100/wtfay restore|r - Undo the last Replace All.",
+        "  " .. T.gold .. "Export|r - Copies your data as text. Send it to a friend.",
+        "  " .. T.gold .. "Import|r - Paste data from a friend.",
+        "    " .. T.white .. "Merge|r keeps your existing data and adds new entries.",
+        "    " .. T.white .. "Replace All|r wipes your data first (a backup is created).",
+        "  " .. T.gold .. "/wtfay restore|r - Undo the last Replace All.",
         " ",
         "|cFF" .. ACCENT .. "--- Quick Reference ---|r",
-        "  |cFFFFD100/wtfay|r - Toggle panel",
-        "  |cFFFFD100/wtfay target|r - Add current target",
-        "  |cFFFFD100/wtfay add Name|r - Add manually",
-        "  |cFFFFD100/wtfay remove Name|r - Remove player",
-        "  |cFFFFD100/wtfay rate Name 3|r - Rate player",
-        "  |cFFFFD100/wtfay note Name text|r - Set note",
-        "  |cFFFFD100/wtfay search term|r - Search",
-        "  |cFFFFD100/wtfay export / import|r - Data sharing",
-        "  |cFFFFD100/wtfay restore|r - Undo replace",
-        "  |cFFFFD100/wtfay stats|r - Database stats",
-        "  |cFFFFD100/wtfay settings|r - Settings",
-        "  |cFFFFD100/wtfay minimap|r - Toggle minimap icon",
-        "  |cFFFFD100/wtfay help|r - Chat help",
+        "  " .. T.gold .. "/wtfay|r - Toggle panel",
+        "  " .. T.gold .. "/wtfay target|r - Add current target",
+        "  " .. T.gold .. "/wtfay add Name|r - Add manually",
+        "  " .. T.gold .. "/wtfay remove Name|r - Remove player",
+        "  " .. T.gold .. "/wtfay rate Name 3|r - Rate player",
+        "  " .. T.gold .. "/wtfay note Name text|r - Set note",
+        "  " .. T.gold .. "/wtfay search term|r - Search",
+        "  " .. T.gold .. "/wtfay export / import|r - Data sharing",
+        "  " .. T.gold .. "/wtfay restore|r - Undo replace",
+        "  " .. T.gold .. "/wtfay stats|r - Database stats",
+        "  " .. T.gold .. "/wtfay settings|r - Settings",
+        "  " .. T.gold .. "/wtfay minimap|r - Toggle minimap icon",
+        "  " .. T.gold .. "/wtfay help|r - Chat help",
         " ",
-        "|cFF888888v" .. ADDON_VERSION .. "  -  Developed by goosefraba|r",
+        T.dim .. "v" .. ADDON_VERSION .. "  -  Developed by goosefraba|r",
     }
 
     hpText:SetText(table.concat(helpLines, "\n"))
@@ -2924,7 +3220,7 @@ do
     end)
 
     -- Close button at bottom
-    local hpDone = CreateFrame("Button", nil, hp, "UIPanelButtonTemplate")
+    local hpDone = CreateFrame("Button", nil, hp, C.ButtonTemplate)
     hpDone:SetSize(80, 22)
     hpDone:SetPoint("BOTTOM", hp, "BOTTOM", 0, 12)
     hpDone:SetText("Close")
@@ -2995,7 +3291,7 @@ StaticPopupDialogs["WTFAY_EDIT_NOTE"] = {
             db.players[key].note = note
             if note ~= "" and db.players[key].pending then
                 db.players[key].pending = nil
-                P("Note updated for " .. db.players[key].name .. " |cFF44FF44(moved to database)|r")
+                P("Note updated for " .. db.players[key].name .. " " .. T.on .. "(moved to database)|r")
             else
                 P("Note updated for " .. db.players[key].name)
             end
@@ -3056,15 +3352,8 @@ if BackdropTemplateMixin then
     Mixin(ratingPicker, BackdropTemplateMixin)
     ratingPicker:OnBackdropLoaded()
 end
-if ratingPicker.SetBackdrop then
-    ratingPicker:SetBackdrop({
-        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-        tile = true, tileSize = 32, edgeSize = 24,
-        insets = { left = 6, right = 6, top = 6, bottom = 6 },
-    })
-    ratingPicker:SetBackdropColor(0.05, 0.05, 0.08, 0.95)
-end
+C.SkinPanel(ratingPicker, { edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
+ratingPicker:SetToplevel(true)
 
 -- Close on Escape
 do
@@ -3079,11 +3368,11 @@ rpTitle:SetPoint("TOP", ratingPicker, "TOP", 0, -12)
 -- Subtitle labels
 local rpBad = ratingPicker:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 rpBad:SetPoint("TOPLEFT", ratingPicker, "TOPLEFT", 14, -30)
-rpBad:SetText("|cFFFF4444Avoid|r")
+rpBad:SetText(T.off .. "Avoid|r")
 
 local rpGood = ratingPicker:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 rpGood:SetPoint("TOPRIGHT", ratingPicker, "TOPRIGHT", -14, -30)
-rpGood:SetText("|cFF44FF44Great|r")
+rpGood:SetText(T.on .. "Great|r")
 
 -- Rating labels for display
 local RATING_LABELS = {
@@ -3142,7 +3431,7 @@ for i = -3, 5 do
     local label = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     label:SetPoint("CENTER", btn, "CENTER", 0, 0)
     local sign = i > 0 and "+" or ""
-    label:SetText("|cFFFFFFFF" .. sign .. i .. "|r")
+    label:SetText(T.white .. sign .. i .. "|r")
 
     btn.ratingValue = i
     btn.bgTex = bg
@@ -3160,7 +3449,7 @@ rpCurrent:SetPoint("TOP", rpDesc, "BOTTOM", 0, -2)
 rpCurrent:SetText("")
 
 -- Cancel button
-local rpCancel = CreateFrame("Button", nil, ratingPicker, "UIPanelButtonTemplate")
+local rpCancel = CreateFrame("Button", nil, ratingPicker, C.ButtonTemplate)
 rpCancel:SetSize(70, 22)
 rpCancel:SetPoint("BOTTOM", ratingPicker, "BOTTOM", 0, 10)
 rpCancel:SetText("Cancel")
@@ -3170,7 +3459,7 @@ rpCancel:SetScript("OnClick", function() ratingPicker:Hide() end)
 for idx, btn in ipairs(ratingButtons) do
     btn:SetScript("OnEnter", function(self)
         local v = self.ratingValue
-        rpDesc:SetText("|cFFFFFFFF" .. RATING_LABELS[v] .. "|r")
+        rpDesc:SetText(T.white .. RATING_LABELS[v] .. "|r")
     end)
     btn:SetScript("OnLeave", function()
         rpDesc:SetText("")
@@ -3184,7 +3473,7 @@ for idx, btn in ipairs(ratingButtons) do
             local wasPending = db.players[key].pending
             if wasPending then
                 db.players[key].pending = nil
-                P(db.players[key].name .. " rated " .. ColorRating(self.ratingValue) .. " |cFF44FF44(moved to database)|r")
+                P(db.players[key].name .. " rated " .. ColorRating(self.ratingValue) .. " " .. T.on .. "(moved to database)|r")
             else
                 P(db.players[key].name .. " rated " .. ColorRating(self.ratingValue))
             end
@@ -3208,7 +3497,7 @@ ShowRatingPicker = function(key)
     local p = db and db.players[key]
     if not p then return end
     rpTitle:SetText("Rate " .. ClassColor(p.class) .. p.name .. "|r")
-    rpCurrent:SetText("|cFF888888Current: " .. ColorRating(p.rating or 0) .. "|r")
+    rpCurrent:SetText(T.dim .. "Current: |r" .. C.RatingIcon(p.rating or 0) .. ColorRating(p.rating or 0))
 
     -- Highlight current rating button with a border effect
     for idx, btn in ipairs(ratingButtons) do
@@ -3226,7 +3515,7 @@ ShowRatingPicker = function(key)
 end
 
 StaticPopupDialogs["WTFAY_CONFIRM_REMOVE"] = {
-    text = "Remove |cFFFF6666%s|r from WTFAY?",
+    text = "Remove " .. T.dangerSoft .. "%s|r from WTFAY?",
     button1 = "Remove",
     button2 = "Cancel",
     OnAccept = function(self)
@@ -3256,8 +3545,8 @@ local ENCOUNTERS_PER_PAGE = 25
 local detailCurrentKey = nil
 local detailPage = 1
 
-local detail = CreateFrame("Frame", "WTFAYDetailPanel", UIParent)
-detail:SetSize(340, 380)
+local detail = C.CreateWindow("WTFAYDetailPanel", UIParent)
+detail:SetSize(340, 400)   -- +20 for the "Met in ..." line
 detail:SetPoint("CENTER", UIParent, "CENTER", 200, 0)
 detail:SetFrameStrata("FULLSCREEN_DIALOG")
 detail:SetMovable(true)
@@ -3272,15 +3561,7 @@ if BackdropTemplateMixin then
     Mixin(detail, BackdropTemplateMixin)
     detail:OnBackdropLoaded()
 end
-if detail.SetBackdrop then
-    detail:SetBackdrop({
-        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-        tile = true, tileSize = 32, edgeSize = 24,
-        insets = { left = 6, right = 6, top = 6, bottom = 6 },
-    })
-    detail:SetBackdropColor(0.05, 0.05, 0.08, 0.96)
-end
+-- Chrome: C.SkinWindow below, once title and close button exist.
 
 -- Close on Escape
 do
@@ -3295,6 +3576,7 @@ detailClose:SetPoint("TOPRIGHT", detail, "TOPRIGHT", -2, -2)
 -- Player name title
 local detailTitle = detail:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 detailTitle:SetPoint("TOPLEFT", detail, "TOPLEFT", 14, -14)
+C.SkinWindow(detail, { title = detailTitle, close = detailClose, edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
 
 -- Info line (race, class, level, realm)
 local detailInfo = detail:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -3312,7 +3594,15 @@ detailNote:SetWordWrap(true)
 
 -- Encounter history header
 local encHeader = detail:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-encHeader:SetPoint("TOPLEFT", detailNote, "BOTTOMLEFT", 0, -12)
+-- Where you first met (zone, their level, yours). Sits between the note and
+-- the history, so the history header now hangs off it.
+local detailMet = detail:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+detailMet:SetPoint("TOPLEFT", detailNote, "BOTTOMLEFT", 0, -6)
+detailMet:SetPoint("RIGHT", detail, "RIGHT", -14, 0)
+detailMet:SetJustifyH("LEFT")
+detailMet:SetWordWrap(false)
+
+encHeader:SetPoint("TOPLEFT", detailMet, "BOTTOMLEFT", 0, -10)
 encHeader:SetText("|cFF" .. ACCENT .. "Encounter History|r")
 
 -- Encounter count
@@ -3325,7 +3615,7 @@ encSep:SetHeight(1)
 encSep:SetPoint("TOPLEFT", encHeader, "BOTTOMLEFT", 0, -4)
 encSep:SetPoint("RIGHT", detail, "RIGHT", -14, 0)
 if encSep.SetColorTexture then
-    encSep:SetColorTexture(0.3, 0.3, 0.3, 0.8)
+    encSep:SetColorTexture(unpack(C.Theme.sep))
 else
     encSep:SetTexture(0.3, 0.3, 0.3, 0.8)
 end
@@ -3340,34 +3630,69 @@ encContainer:SetPoint("TOPLEFT", encSep, "BOTTOMLEFT", 0, -4)
 encContainer:SetPoint("RIGHT", detail, "RIGHT", -14, 0)
 encContainer:SetHeight(MAX_VISIBLE_ENC * ENC_ROW_HEIGHT)
 
-for i = 1, MAX_VISIBLE_ENC do
-    local row = detail:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row:SetPoint("TOPLEFT", encContainer, "TOPLEFT", 0, -((i - 1) * ENC_ROW_HEIGHT))
-    row:SetPoint("RIGHT", encContainer, "RIGHT", 0, 0)
-    row:SetJustifyH("LEFT")
-    row:SetWordWrap(false)
-    row:Hide()
-    encRows[i] = row
+do
+    -- Full details of one encounter on hover; the row itself is kept short.
+    local function ShowEncounterTooltip(row)
+        local e = row.entry
+        if not e then return end
+        GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+        local where = e.zone or (e.remote and "Added by name" or "Unknown location")
+        if e.subzone then where = where .. " - " .. e.subzone end
+        GameTooltip:SetText(where, 1, 0.82, 0)
+        GameTooltip:AddLine((e.time or "?") .. "  (" .. (e.source or "?") .. ")", 0.8, 0.8, 0.8)
+        if e.lvl then GameTooltip:AddLine("They were level " .. e.lvl, 1, 1, 1) end
+        if e.myLvl then GameTooltip:AddLine("You were level " .. e.myLvl, 1, 1, 1) end
+        if e.remote then
+            GameTooltip:AddLine("You weren't grouped, so no location was recorded.", 0.6, 0.6, 0.6, true)
+        elseif not e.lvl and not e.myLvl then
+            GameTooltip:AddLine("Logged before WTFAY recorded levels.", 0.6, 0.6, 0.6, true)
+        end
+        GameTooltip:Show()
+    end
+
+    for i = 1, MAX_VISIBLE_ENC do
+        local row = CreateFrame("Frame", nil, encContainer)
+        row:SetHeight(ENC_ROW_HEIGHT)
+        row:SetPoint("TOPLEFT", encContainer, "TOPLEFT", 0, -((i - 1) * ENC_ROW_HEIGHT))
+        row:SetPoint("RIGHT", encContainer, "RIGHT", 0, 0)
+        row:EnableMouse(true)
+
+        -- Levels on the right; the description takes the rest and truncates.
+        row.levels = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        row.levels:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+        row.levels:SetJustifyH("RIGHT")
+
+        row.text = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        row.text:SetPoint("LEFT", row, "LEFT", 0, 0)
+        row.text:SetPoint("RIGHT", row.levels, "LEFT", -6, 0)
+        row.text:SetJustifyH("LEFT")
+        row.text:SetWordWrap(false)
+
+        row:SetScript("OnEnter", ShowEncounterTooltip)
+        row:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        row:Hide()
+        encRows[i] = row
+    end
 end
 
 -- Page navigation
 local pageInfo = detail:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 pageInfo:SetPoint("BOTTOM", detail, "BOTTOM", 0, 30)
 
-local prevBtn = CreateFrame("Button", nil, detail, "UIPanelButtonTemplate")
+local prevBtn = CreateFrame("Button", nil, detail, C.ButtonTemplate)
 prevBtn:SetSize(60, 20)
 prevBtn:SetPoint("RIGHT", pageInfo, "LEFT", -8, 0)
 prevBtn:SetText("Newer")
 prevBtn:SetNormalFontObject(GameFontNormalSmall)
 
-local nextBtn = CreateFrame("Button", nil, detail, "UIPanelButtonTemplate")
+local nextBtn = CreateFrame("Button", nil, detail, C.ButtonTemplate)
 nextBtn:SetSize(60, 20)
 nextBtn:SetPoint("LEFT", pageInfo, "RIGHT", 8, 0)
 nextBtn:SetText("Older")
 nextBtn:SetNormalFontObject(GameFontNormalSmall)
 
 -- Action buttons at bottom
-local detailRateBtn = CreateFrame("Button", nil, detail, "UIPanelButtonTemplate")
+local detailRateBtn = CreateFrame("Button", nil, detail, C.ButtonTemplate)
 detailRateBtn:SetSize(70, 20)
 detailRateBtn:SetPoint("BOTTOMLEFT", detail, "BOTTOMLEFT", 10, 8)
 detailRateBtn:SetText("Rate")
@@ -3376,7 +3701,7 @@ detailRateBtn:SetScript("OnClick", function()
     if detailCurrentKey then ShowRatingPicker(detailCurrentKey) end
 end)
 
-local detailNoteBtn = CreateFrame("Button", nil, detail, "UIPanelButtonTemplate")
+local detailNoteBtn = CreateFrame("Button", nil, detail, C.ButtonTemplate)
 detailNoteBtn:SetSize(80, 20)
 detailNoteBtn:SetPoint("LEFT", detailRateBtn, "RIGHT", 4, 0)
 detailNoteBtn:SetText("Edit Note")
@@ -3388,15 +3713,18 @@ detailNoteBtn:SetScript("OnClick", function()
     end
 end)
 
-local detailRemoveBtn = CreateFrame("Button", nil, detail, "UIPanelButtonTemplate")
+local detailRemoveBtn = CreateFrame("Button", nil, detail, C.ButtonTemplate)
 detailRemoveBtn:SetSize(70, 20)
 detailRemoveBtn:SetPoint("LEFT", detailNoteBtn, "RIGHT", 4, 0)
-detailRemoveBtn:SetText("|cFFFF4444Remove|r")
+detailRemoveBtn:SetText(T.off .. "Remove|r")
 detailRemoveBtn:SetNormalFontObject(GameFontNormalSmall)
-detailRemoveBtn:SetScript("OnClick", function()
+-- Two clicks within 3s; the row context menu keeps its popup, since a menu
+-- closes on the first click and can't arm.
+C.ArmConfirm(detailRemoveBtn, function()
     if detailCurrentKey and db and db.players[detailCurrentKey] then
         popupActiveKey = detailCurrentKey
-        StaticPopup_Show("WTFAY_CONFIRM_REMOVE", db.players[detailCurrentKey].name)
+        local dlg = StaticPopupDialogs["WTFAY_CONFIRM_REMOVE"]
+        if dlg and dlg.OnAccept then dlg.OnAccept() end
     end
 end)
 
@@ -3414,20 +3742,25 @@ local function RefreshDetailPanel()
     detailTitle:SetText(cc .. p.name .. "|r")
 
     local raceStr = (p.race and p.race ~= "") and (p.race .. " ") or ""
-    detailInfo:SetText("|cFFBBBBBBLv " .. (p.level or "?") .. "  " .. raceStr .. "|r" .. cc .. (p.class or "Unknown") .. "|r  |cFF888888" .. (p.realm or "") .. "|r")
+    local guildStr = (p.guild and p.guild ~= "") and ("  " .. T.guild .. "<" .. p.guild .. ">|r") or ""
+    local zoneStr  = (p.zone and p.zone ~= "") and ("  " .. T.faint .. "seen in " .. p.zone .. "|r") or ""
+    detailInfo:SetText(T.soft .. "Lv " .. (p.level or "?") .. "  " .. raceStr .. "|r" .. cc .. (p.class or "Unknown") .. "|r  " .. T.dim .. (p.realm or "") .. "|r" .. guildStr .. zoneStr)
 
-    detailRating:SetText("Rating: " .. ColorRating(p.rating or 0) .. "  |cFFAAAAAA" .. (RATING_LABELS[p.rating or 0] or "") .. "|r")
+    detailRating:SetText("Rating: " .. C.RatingIcon(p.rating or 0) .. ColorRating(p.rating or 0) .. "  " .. T.muted .. (RATING_LABELS[p.rating or 0] or "") .. "|r")
 
     if p.note and p.note ~= "" then
-        detailNote:SetText("|cFFDDDDDD" .. p.note .. "|r")
+        detailNote:SetText(T.text .. p.note .. "|r")
     else
-        detailNote:SetText("|cFF666666(no note)|r")
+        detailNote:SetText(T.faint .. "(no note)|r")
     end
 
     -- Encounters: display newest first
     local enc = p.encounters or {}
     local totalEnc = #enc
-    encCount:SetText("|cFF888888(" .. totalEnc .. " total)|r")
+    encCount:SetText(T.dim .. "(" .. totalEnc .. " total)|r")
+
+    local met = MetLineFor(p)
+    detailMet:SetText(met and (T.brass .. met .. "|r") or "")
 
     local totalPages = math.max(1, math.ceil(totalEnc / ENCOUNTERS_PER_PAGE))
     if detailPage > totalPages then detailPage = totalPages end
@@ -3451,11 +3784,17 @@ local function RefreshDetailPanel()
         if e then
             local sc = srcColors[e.source or "manual"] or "CCCCCC"
             local num = totalEnc - i + 1  -- encounter number, newest = 1
-            local zoneStr = (e.zone and e.zone ~= "") and ("  |cFFDDAA44" .. e.zone .. "|r") or ""
-            encRows[visibleCount]:SetText(
-                "|cFF666666#" .. num .. "|r  |cFFCCCCCC" .. (e.time or "?") .. "|r  |cFF" .. sc .. (e.source or "?") .. "|r" .. zoneStr
-            )
-            encRows[visibleCount]:Show()
+            local row = encRows[visibleCount]
+            -- Year dropped to make room for the place; the tooltip has the full stamp.
+            local when = (e.time or "?"):gsub("^%d+%-", "")
+            local zoneStr = (e.zone and e.zone ~= "") and ("  " .. T.brass .. e.zone .. "|r") or ""
+            row.text:SetText(T.faint .. "#" .. num .. "|r  " .. T.light .. when .. "|r  |cFF" .. sc .. (e.source or "?") .. "|r" .. zoneStr)
+            local lv = ""
+            if e.lvl then lv = T.soft .. "Lv " .. e.lvl .. "|r" end
+            if e.myLvl then lv = lv .. (lv ~= "" and "  " or "") .. T.dim .. "you " .. e.myLvl .. "|r" end
+            row.levels:SetText(lv)
+            row.entry = e
+            row:Show()
         end
     end
 
@@ -3470,7 +3809,7 @@ local function RefreshDetailPanel()
 
     -- Page info and buttons
     if totalPages > 1 or hasMoreOnPage then
-        pageInfo:SetText("|cFFAAAAAA" .. detailPage .. " / " .. totalPages .. "|r")
+        pageInfo:SetText(T.muted .. detailPage .. " / " .. totalPages .. "|r")
         pageInfo:Show()
         prevBtn:SetShown(detailPage > 1)
         nextBtn:SetShown(detailPage < totalPages)
@@ -3504,20 +3843,19 @@ D("detail panel OK")
 ----------------------------------------------------------------------
 -- Core API
 ----------------------------------------------------------------------
-local function AddPlayer(nameRealm, source)
-    local name, realm = nameRealm:match("^(.+)-(.+)$")
-    if not name then
-        name  = nameRealm
-        realm = GetRealmName() or "Unknown"
-    end
-    name = name:sub(1,1):upper() .. name:sub(2):lower()
+-- Defined further down in the /who enrichment section; declared here so
+-- AddPlayer can queue a lookup for players added by name alone.
+local WhoEnrich
 
-    local key = name .. "-" .. realm
+local function AddPlayer(nameRealm, source)
+    local name, realm = SplitNameRealm(nameRealm)
+    if not name or name == "" then return nil end
+    local key = MakeKey(name, realm)
     if db.players[key] then
         db.players[key].seen   = Timestamp()
         db.players[key].source = source or db.players[key].source
-        LogEncounter(key, source or db.players[key].source)
-        P("Updated |cFFFFFFFF" .. name .. "|r (already tracked)")
+        LogEncounter(key, source or db.players[key].source, nil, nil, true)   -- added by name
+        P("Updated " .. T.white .. name .. "|r (already tracked)")
     else
         db.players[key] = {
             name       = name,
@@ -3531,28 +3869,28 @@ local function AddPlayer(nameRealm, source)
             seen       = Timestamp(),
             encounters = {},
         }
-        LogEncounter(key, source or "manual")
-        P("Added |cFFFFFFFF" .. name .. "-" .. realm .. "|r")
+        LogEncounter(key, source or "manual", nil, nil, true)   -- added by name
+        P("Added " .. T.white .. name .. "-" .. realm .. "|r")
+        -- Added by name alone, so there is no unit to read class/level from.
+        if WhoEnrich and db.settings and db.settings.whoEnrich then
+            WhoEnrich(key, false)
+        end
     end
     RefreshList()
     return key
 end
 
 local function RemovePlayer(nameRealm)
-    local name, realm = nameRealm:match("^(.+)-(.+)$")
-    if not name then
-        name  = nameRealm
-        realm = GetRealmName() or "Unknown"
-    end
-    name = name:sub(1,1):upper() .. name:sub(2):lower()
-    local key = name .. "-" .. realm
+    local name, realm = SplitNameRealm(nameRealm)
+    if not name or name == "" then return end
+    local key = MakeKey(name, realm)
 
     if db.players[key] then
         db.players[key] = nil
-        P("Removed |cFFFF6666" .. name .. "|r")
+        P("Removed " .. T.dangerSoft .. name .. "|r")
         RefreshList()
     else
-        P("Player |cFFFFFFFF" .. name .. "|r not found.")
+        P("Player " .. T.white .. name .. "|r not found.")
     end
 end
 
@@ -3562,28 +3900,24 @@ local function SearchPlayers(query)
     for key, p in pairs(db.players) do
         if p.name:lower():find(query, 1, true) or (p.note or ""):lower():find(query, 1, true) then
             local cc = ClassColor(p.class)
-            P(cc .. p.name .. "|r  " .. ColorRating(p.rating) .. "  |cFFAAAAAA" .. (p.note or "") .. "|r")
+            P(cc .. p.name .. "|r  " .. ColorRating(p.rating) .. "  " .. T.muted .. (p.note or "") .. "|r")
             found = found + 1
         end
     end
     if found == 0 then
-        P("No players matching |cFFFFFFFF" .. query .. "|r")
+        P("No players matching " .. T.white .. query .. "|r")
     else
         P(found .. " result" .. (found == 1 and "" or "s") .. " found.")
     end
 end
 
 local function RatePlayer(nameRealm, rating)
-    local name, realm = nameRealm:match("^(.+)-(.+)$")
-    if not name then
-        name  = nameRealm
-        realm = GetRealmName() or "Unknown"
-    end
-    name = name:sub(1,1):upper() .. name:sub(2):lower()
-    local key = name .. "-" .. realm
+    local name, realm = SplitNameRealm(nameRealm)
+    if not name or name == "" then return end
+    local key = MakeKey(name, realm)
 
     if not db.players[key] then
-        P("Player |cFFFFFFFF" .. name .. "|r not found. Add them first.")
+        P("Player " .. T.white .. name .. "|r not found. Add them first.")
         return
     end
     rating = math.max(-3, math.min(5, math.floor(rating)))
@@ -3596,16 +3930,12 @@ local function RatePlayer(nameRealm, rating)
 end
 
 local function NotePlayer(nameRealm, note)
-    local name, realm = nameRealm:match("^(.+)-(.+)$")
-    if not name then
-        name  = nameRealm
-        realm = GetRealmName() or "Unknown"
-    end
-    name = name:sub(1,1):upper() .. name:sub(2):lower()
-    local key = name .. "-" .. realm
+    local name, realm = SplitNameRealm(nameRealm)
+    if not name or name == "" then return end
+    local key = MakeKey(name, realm)
 
     if not db.players[key] then
-        P("Player |cFFFFFFFF" .. name .. "|r not found. Add them first.")
+        P("Player " .. T.white .. name .. "|r not found. Add them first.")
         return
     end
     db.players[key].note = note
@@ -3616,39 +3946,228 @@ end
 D("core API OK")
 
 ----------------------------------------------------------------------
+-- /who enrichment
+--
+-- Group scans read class/race/level straight off the unit, but players
+-- added by name (/wtfay add, an import, or someone who left before we
+-- scanned) land with class "Unknown" and level 0. A throttled /who lookup
+-- fills those in, plus guild and current zone, which no unit API exposes.
+--
+-- C_FriendList.GetWhoInfo exists on 2.5.6 and hands back a structured
+-- record, so we never parse chat text. info.filename is the
+-- locale-independent class token ("WARRIOR"), which is what we store —
+-- info.classStr would be "Krieger" on a German client and break class
+-- colors. Results are routed to the UI (SetWhoToUi) while a query is in
+-- flight so lookups don't spam the chat frame.
+----------------------------------------------------------------------
+local WhoEnrichMissing
+do
+    local WHO_INTERVAL  = 5    -- seconds between queries; the server throttles /who
+    local WHO_TIMEOUT   = 10   -- abandon a query that gets no answer
+    local WHO_MAX_QUEUE = 40
+
+    local whoQueue    = {}     -- pending { key, report } entries
+    local whoQueued   = {}     -- key -> true, dedup
+    local whoActive   = nil    -- { key, name, report, sentAt }
+    local whoLastSent = 0
+
+    local function WhoAvailable()
+        return C_FriendList and C_FriendList.SendWho and C_FriendList.GetWhoInfo
+            and C_FriendList.GetNumWhoResults and C_FriendList.SetWhoToUi
+    end
+
+    -- Queue a lookup. report=true prints the outcome (manual lookups only).
+    WhoEnrich = function(key, report)
+        if not WhoAvailable() then
+            if report then P("/who lookups aren't available on this client.") end
+            return false
+        end
+        if not db or not db.players[key] then return false end
+        if whoQueued[key] then return true end
+        if #whoQueue >= WHO_MAX_QUEUE then
+            if report then P("/who queue is full, try again shortly.") end
+            return false
+        end
+        whoQueue[#whoQueue + 1] = { key = key, report = report and true or false }
+        whoQueued[key] = true
+        return true
+    end
+
+    -- Queue every player still missing class, level, or a previous lookup.
+    WhoEnrichMissing = function()
+        if not db or not db.players then return 0 end
+        local n = 0
+        for key, p in pairs(db.players) do
+            if (p.class or "Unknown") == "Unknown" or (p.level or 0) == 0 or not p.whoChecked then
+                if WhoEnrich(key, false) then n = n + 1 end
+            end
+        end
+        return n
+    end
+
+    local function ApplyWhoInfo(key, info)
+        local p = db and db.players[key]
+        if not p then return nil end
+        local changed = {}
+
+        local classToken = info.filename
+        if classToken and classToken ~= "" then
+            local className = TitleCase(classToken)
+            if className ~= "" and className ~= p.class then
+                p.class = className
+                changed[#changed + 1] = "class"
+            end
+        end
+
+        local lvl = tonumber(info.level) or 0
+        if lvl > (p.level or 0) then
+            p.level = lvl
+            changed[#changed + 1] = "level"
+        end
+
+        if info.raceStr and info.raceStr ~= "" and info.raceStr ~= p.race then
+            p.race = info.raceStr
+            changed[#changed + 1] = "race"
+        end
+
+        if info.fullGuildName and info.fullGuildName ~= "" and info.fullGuildName ~= p.guild then
+            p.guild = info.fullGuildName
+            changed[#changed + 1] = "guild"
+        end
+
+        if info.area and info.area ~= "" then
+            p.zone = info.area
+            p.zoneSeen = Timestamp()
+        end
+
+        p.whoChecked = Timestamp()
+        return changed
+    end
+
+    local function WhoFinish()
+        whoActive = nil
+        if WhoAvailable() then pcall(C_FriendList.SetWhoToUi, false) end
+    end
+
+    local function WhoSendNext()
+        if whoActive or #whoQueue == 0 then return end
+        if not WhoAvailable() then return end
+        if InCombatLockdown() then return end
+        -- Don't fight the player's own /who while the social panel is open.
+        if FriendsFrame and FriendsFrame:IsShown() then return end
+        if (time() - whoLastSent) < WHO_INTERVAL then return end
+
+        local entry = table.remove(whoQueue, 1)
+        whoQueued[entry.key] = nil
+        local p = db and db.players[entry.key]
+        if not p or not p.name then return end
+
+        whoActive   = { key = entry.key, name = p.name, report = entry.report, sentAt = time() }
+        whoLastSent = time()
+        pcall(C_FriendList.SetWhoToUi, true)
+        pcall(C_FriendList.SendWho, 'n-"' .. p.name .. '"')
+        D("who: querying " .. p.name)
+    end
+
+    local whoFrame = CreateFrame("Frame")
+    whoFrame:RegisterEvent("WHO_LIST_UPDATE")
+    whoFrame:SetScript("OnEvent", function()
+        if not whoActive then return end
+
+        local matched
+        local num = C_FriendList.GetNumWhoResults and C_FriendList.GetNumWhoResults() or 0
+        for i = 1, num do
+            local info = C_FriendList.GetWhoInfo(i)
+            if info and info.fullName then
+                local shortName = info.fullName:match("^([^%-]+)") or info.fullName
+                if shortName:lower() == (whoActive.name or ""):lower() then
+                    matched = info
+                    break
+                end
+            end
+        end
+
+        local active = whoActive
+        WhoFinish()
+
+        if not matched then
+            if active.report then
+                P(T.white .. active.name .. "|r wasn't found by /who (offline, hidden, or opposite faction).")
+            end
+            return
+        end
+
+        local changed = ApplyWhoInfo(active.key, matched)
+        local p = db and db.players[active.key]
+        if active.report and p then
+            local guildStr = (p.guild and p.guild ~= "") and ("  " .. T.guild .. "<" .. p.guild .. ">|r") or ""
+            local zoneStr  = (p.zone and p.zone ~= "") and ("  " .. T.dim .. "in " .. p.zone .. "|r") or ""
+            P(ClassColor(p.class) .. p.name .. "|r  " .. T.soft .. "Lv " .. (p.level or "?") .. " "
+              .. (p.race or "") .. " " .. (p.class or "Unknown") .. "|r" .. guildStr .. zoneStr)
+            if changed and #changed == 0 then
+                P(T.dim .. "(nothing new)|r")
+            end
+        end
+        RefreshList()
+    end)
+
+    if WhoAvailable() then
+        C_Timer.NewTicker(1, function()
+            if whoActive and (time() - whoActive.sentAt) > WHO_TIMEOUT then
+                local active = whoActive
+                WhoFinish()
+                D("who: timed out for " .. tostring(active.name))
+                if active.report then
+                    P(T.dim .. "/who lookup for " .. active.name .. " timed out.|r")
+                end
+            end
+            WhoSendNext()
+        end)
+        D("/who enrichment OK")
+    else
+        D("/who enrichment unavailable on this client")
+    end
+end
+
+----------------------------------------------------------------------
 -- Slash command
 ----------------------------------------------------------------------
 local HELP_TEXT = {
     " ",
     "|cFF" .. ACCENT .. "========== WTFAY - Who The F* Are You? ==========|r",
-    "|cFF888888Track, rate, and remember every player you encounter.|r",
+    T.dim .. "Track, rate, and remember every player you encounter.|r",
     " ",
     "|cFF" .. ACCENT .. "General:|r",
-    "  |cFFFFD100/wtfay|r - Toggle the main panel",
-    "  |cFFFFD100/wtfay help|r - Show this help",
-    "  |cFFFFD100/wtfay settings|r - Open settings panel",
-    "  |cFFFFD100/wtfay stats|r - Show database statistics",
+    "  " .. T.gold .. "/wtfay|r - Toggle the main panel",
+    "  " .. T.gold .. "/wtfay help|r - Show this help",
+    "  " .. T.gold .. "/wtfay settings|r - Open settings panel",
+    "  " .. T.gold .. "/wtfay stats|r - Show database statistics",
     " ",
     "|cFF" .. ACCENT .. "Player Management:|r",
-    "  |cFFFFD100/wtfay target|r - Add your current target (auto-detects class, race, level)",
-    "  |cFFFFD100/wtfay add Name|r or |cFFFFD100Name-Realm|r - Add a player manually",
-    "  |cFFFFD100/wtfay remove Name|r - Remove a player from the database",
-    "  |cFFFFD100/wtfay rate Name 3|r - Rate a player (-3 to 5)",
-    "  |cFFFFD100/wtfay note Name Some text|r - Set a note on a player",
-    "  |cFFFFD100/wtfay search term|r - Search players by name",
+    "  " .. T.gold .. "/wtfay target|r - Add your current target (auto-detects class, race, level)",
+    "  " .. T.gold .. "/wtfay add Name|r or " .. T.gold .. "Name-Realm|r - Add a player manually",
+    "  " .. T.gold .. "/wtfay remove Name|r - Remove a player from the database",
+    "  " .. T.gold .. "/wtfay rate Name 3|r - Rate a player (-3 to 5)",
+    "  " .. T.gold .. "/wtfay note Name Some text|r - Set a note on a player",
+    "  " .. T.gold .. "/wtfay search term|r - Search players by name",
     " ",
     "|cFF" .. ACCENT .. "Data:|r",
-    "  |cFFFFD100/wtfay export|r - Export your database to share with friends",
-    "  |cFFFFD100/wtfay import|r - Import a database (merge or replace)",
-    "  |cFFFFD100/wtfay restore|r - Undo last Replace All from a backup",
+    "  " .. T.gold .. "/wtfay export|r - Export your database to share with friends",
+    "  " .. T.gold .. "/wtfay import|r - Import a database (merge or replace)",
+    "  " .. T.gold .. "/wtfay restore|r - Undo last Replace All from a backup",
+    " ",
+    "|cFF" .. ACCENT .. "Lookups:|r",
+    "  " .. T.gold .. "/wtfay who Name|r - Fill in class, level, guild, and zone via /who",
+    "  " .. T.gold .. "/wtfay whoall|r - Queue a /who for every player missing details",
     " ",
     "|cFF" .. ACCENT .. "Options:|r",
-    "  |cFFFFD100/wtfay minimap|r - Toggle minimap button on/off",
-    "  |cFFFFD100/wtfay debug|r - Toggle debug logging",
+    "  " .. T.gold .. "/wtfay minimap|r - Toggle minimap button on/off",
+    "  " .. T.gold .. "/wtfay debug|r - Toggle debug logging",
     " ",
-    "|cFF888888Tips: Left-click a player row for details. Right-click for context menu.|r",
-    "|cFF888888Use the filters at the top to narrow by rating, source, or class.|r",
-    "|cFF888888Click the minimap icon to quickly open WTFAY.|r",
+    T.dim .. "Tips: Left-click a player row for details. Right-click for context menu.|r",
+    T.dim .. "Use the filters at the top to narrow by rating, source, or class.|r",
+    T.dim .. "Right-click a player anywhere in the UI for \"WTFAY: Rate / Note\".|r",
+    T.dim .. "Click the minimap icon to quickly open WTFAY.|r",
     "|cFF" .. ACCENT .. "=================================================|r",
 }
 
@@ -3690,6 +4209,27 @@ SlashCmdList["WTFAY"] = function(msg)
             P("Usage: /wtfay note PlayerName Some text here")
         end
 
+    elseif cmd == "who" then
+        if rest == "" then
+            P("Usage: /wtfay who PlayerName")
+        else
+            local name, realm = SplitNameRealm(rest)
+            local key = MakeKey(name, realm)
+            if not db.players[key] then
+                P("Player " .. T.white .. name .. "|r not found. Add them first: " .. T.gold .. "/wtfay add " .. name .. "|r")
+            elseif WhoEnrich(key, true) then
+                P("Looking up " .. T.white .. name .. "|r via /who...")
+            end
+        end
+
+    elseif cmd == "whoall" then
+        local n = WhoEnrichMissing()
+        if n == 0 then
+            P("Nothing to look up - every player already has class, level, and a /who check.")
+        else
+            P("Queued " .. T.gold .. n .. "|r player(s) for /who lookup (~5s apart).")
+        end
+
     elseif cmd == "search" or cmd == "find" then
         if rest ~= "" then SearchPlayers(rest) else P("Usage: /wtfay search term") end
 
@@ -3710,7 +4250,7 @@ SlashCmdList["WTFAY"] = function(msg)
     elseif cmd == "debug" then
         DEBUG = not DEBUG
         if db and db.settings then db.settings.debug = DEBUG end
-        P("Debug mode: " .. (DEBUG and "|cFF44FF44ON|r" or "|cFFFF4444OFF|r"))
+        P("Debug mode: " .. (DEBUG and T.on .. "ON|r" or T.off .. "OFF|r"))
 
     elseif cmd == "export" then
         if importExportPanel and importExportPanel.ShowExport then
@@ -3745,7 +4285,7 @@ SlashCmdList["WTFAY"] = function(msg)
                 end
             end
             table.remove(db.backups, 1)
-            P("Restored backup from |cFFFFD100" .. (bk.time or "?") .. "|r (" .. count .. " players). " .. #db.backups .. " backup(s) remaining.")
+            P("Restored backup from " .. T.gold .. (bk.time or "?") .. "|r (" .. count .. " players). " .. #db.backups .. " backup(s) remaining.")
             RefreshList()
         end
 
@@ -3758,21 +4298,51 @@ SlashCmdList["WTFAY"] = function(msg)
         local hidden = db.minimapHidden
         db.minimapHidden = not hidden
         if db.minimapHidden then minimapBtn:Hide() else minimapBtn:Show() end
-        P("Minimap button: " .. (db.minimapHidden and "|cFFFF4444hidden|r" or "|cFF44FF44shown|r"))
+        P("Minimap button: " .. (db.minimapHidden and T.off .. "hidden|r" or T.on .. "shown|r"))
 
     elseif cmd == "settings" or cmd == "config" or cmd == "options" then
-        if settingsPanel and settingsPanel.OpenBliz then
-            settingsPanel.OpenBliz()
-        elseif settingsPanel and settingsPanel.Toggle then
+        -- Open the Settings tab in the main window. The game's AddOns page
+        -- is generated from the same settings spec.
+        if settingsPanel and settingsPanel.Toggle then
             settingsPanel.Toggle()
+        elseif settingsPanel and settingsPanel.OpenBliz then
+            settingsPanel.OpenBliz()
         end
 
     else
-        P("Unknown command: " .. cmd .. ". Type |cFFFFD100/wtfay help|r")
+        P("Unknown command: " .. cmd .. ". Type " .. T.gold .. "/wtfay help|r")
     end
 end
 
 D("slash command registered OK")
+
+----------------------------------------------------------------------
+-- Addon Compartment (Mainline only)
+--
+-- The native entry point for addons on modern clients, declared via
+-- ## AddonCompartmentFunc in the TOC. Classic ignores the tag, so this
+-- global simply never gets called there.
+----------------------------------------------------------------------
+function WTFAY_OnAddonCompartmentClick(_, button)
+    if button == "RightButton" then
+        if settingsPanel and settingsPanel.Toggle then settingsPanel.Toggle() end
+    else
+        if f:IsShown() then f:Hide() else f:Show() end
+    end
+end
+
+function WTFAY_OnAddonCompartmentEnter()
+    if not GameTooltip or not AddonCompartmentFrame then return end
+    GameTooltip:SetOwner(AddonCompartmentFrame, "ANCHOR_LEFT")
+    GameTooltip:AddLine("|cFF" .. ACCENT .. "WTFAY|r")
+    GameTooltip:AddLine("Left-click to open the player browser", 0.7, 0.7, 0.7)
+    GameTooltip:AddLine("Right-click for settings", 0.7, 0.7, 0.7)
+    GameTooltip:Show()
+end
+
+function WTFAY_OnAddonCompartmentLeave()
+    if GameTooltip then GameTooltip:Hide() end
+end
 
 ----------------------------------------------------------------------
 -- Known Player Alert Popup
@@ -3793,15 +4363,8 @@ if BackdropTemplateMixin then
     Mixin(alertPopupFrame, BackdropTemplateMixin)
     alertPopupFrame:OnBackdropLoaded()
 end
-if alertPopupFrame.SetBackdrop then
-    alertPopupFrame:SetBackdrop({
-        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-        tile = true, tileSize = 32, edgeSize = 24,
-        insets = { left = 6, right = 6, top = 6, bottom = 6 },
-    })
-    alertPopupFrame:SetBackdropColor(0.08, 0.02, 0.02, 0.95)
-end
+C.SkinPanel(alertPopupFrame, { edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 }, bg = { 0.10, 0.03, 0.03, 0.95 } })
+alertPopupFrame:SetToplevel(true)
 
 -- Close on Escape
 do
@@ -3821,7 +4384,7 @@ alertTitle:SetPoint("TOP", alertPopupFrame, "TOP", 0, -14)
 local alertLines = {}
 
 -- Dismiss button
-local alertDismiss = CreateFrame("Button", nil, alertPopupFrame, "UIPanelButtonTemplate")
+local alertDismiss = CreateFrame("Button", nil, alertPopupFrame, C.ButtonTemplate)
 alertDismiss:SetSize(80, 22)
 alertDismiss:SetText("Dismiss")
 alertDismiss:SetScript("OnClick", function() alertPopupFrame:Hide() end)
@@ -3845,12 +4408,12 @@ local function ShowAlertPopup(knownPlayers, isLeave)
 
     -- Title
     if isLeave then
-        alertTitle:SetText("|cFFAAAABBKnown Player Left|r")
+        alertTitle:SetText(T.slate .. "Known Player Left|r")
         if alertPopupFrame.SetBackdropColor then
             alertPopupFrame:SetBackdropColor(0.06, 0.06, 0.08, 0.92)
         end
     elseif blacklistCount > 0 then
-        alertTitle:SetText("|cFFFF4444!! Known Players Alert !!|r")
+        alertTitle:SetText(T.off .. "!! Known Players Alert !!|r")
         if alertPopupFrame.SetBackdropColor then
             alertPopupFrame:SetBackdropColor(0.12, 0.02, 0.02, 0.96)
         end
@@ -3894,15 +4457,15 @@ local function ShowAlertPopup(knownPlayers, isLeave)
         line:SetPoint("RIGHT", alertPopupFrame, "RIGHT", -14, 0)
 
         local cc = ClassColor(p.class)
-        local ratingStr = ColorRating(p.rating or 0)
+        local ratingStr = C.RatingIcon(p.rating or 0) .. ColorRating(p.rating or 0)
         local prefix = ""
         if p.rating and p.rating <= -3 then
-            prefix = "|cFFFF0000[BLACKLISTED]|r  "
+            prefix = T.blacklist .. "[BLACKLISTED]|r  "
         end
         line.nameText:SetText(prefix .. cc .. p.name .. "|r  " .. cc .. (p.class or "") .. "|r  Lv " .. (p.level or "?") .. "  Rating: " .. ratingStr)
 
         if p.note and p.note ~= "" then
-            line.noteText:SetText("|cFFBBBBBB\"" .. p.note .. "\"|r")
+            line.noteText:SetText(T.soft .. "\"" .. p.note .. "\"|r")
         else
             line.noteText:SetText("")
         end
@@ -3995,9 +4558,9 @@ local function FireAlert(players, title, isLeave)
         local p = kp.player
         local cc = ClassColor(p.class)
         local ratingStr = ColorRating(p.rating or 0)
-        local noteStr = (p.note and p.note ~= "") and ("  |cFFBBBBBB\"" .. p.note .. "\"|r") or ""
+        local noteStr = (p.note and p.note ~= "") and ("  " .. T.soft .. "\"" .. p.note .. "\"|r") or ""
         if p.rating and p.rating <= -3 then
-            P("  |cFFFF0000>>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+            P("  " .. T.blacklist .. ">>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
         else
             P("  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
         end
@@ -4022,7 +4585,7 @@ local function ScanGroupMembers()
         lastScanMembers = nil
         local inboxCount = GetInboxCount()
         if inboxCount > 0 then
-            P("|cFFFF8800" .. inboxCount .. "|r player" .. (inboxCount == 1 and "" or "s") .. " in your inbox to review. Type |cFFFFD100/wtfay|r to open.")
+            P(T.warn .. inboxCount .. "|r player" .. (inboxCount == 1 and "" or "s") .. " in your inbox to review. Type " .. T.gold .. "/wtfay|r to open.")
         end
         RefreshList()
         if RefreshInbox then RefreshInbox() end
@@ -4031,23 +4594,20 @@ local function ScanGroupMembers()
     end
 
     local source, zone = GetGroupSourceAndZone()
-    local myName = UnitName("player") or ""
+    local myName = C.UnitIdentity("player") or ""
     local numMembers
     local knownPlayers = {}  -- collect known players for alerts
     local guildSet = nil     -- lazy-loaded
 
     -- Helper: process a single unit
     local function ProcessUnit(unit)
-        if not UnitExists(unit) or not UnitIsPlayer(unit) then return end
-        local name, realm = UnitName(unit)
+        local name, realm = C.UnitIdentity(unit)
         if not name or name == myName then return end
-
-        realm = (realm and realm ~= "") and realm or (GetRealmName() or "Unknown")
         local _, classFile = UnitClass(unit)
-        local className = classFile and (classFile:sub(1,1):upper() .. classFile:sub(2):lower()) or "Unknown"
+        local className = classFile and TitleCase(classFile) or "Unknown"
         local raceName = UnitRace(unit) or ""
         local level = UnitLevel(unit) or 0
-        local key = name .. "-" .. realm
+        local key = MakeKey(name, realm)
         local wasKnown = db.players[key] ~= nil
 
         if wasKnown then
@@ -4057,7 +4617,7 @@ local function ScanGroupMembers()
             if raceName ~= "" then p.race = raceName end
             if level > 0 and level > (p.level or 0) then p.level = level end
             p.source = source
-            LogEncounter(key, source, zone)
+            LogEncounter(key, source, zone, level)
         else
             db.players[key] = {
                 name = name, realm = realm, class = className,
@@ -4065,7 +4625,7 @@ local function ScanGroupMembers()
                 note = "", source = source, seen = Timestamp(),
                 encounters = {}, pending = true,
             }
-            LogEncounter(key, source, zone)
+            LogEncounter(key, source, zone, level)
             D("New player added to inbox: " .. name)
             P(ClassColor(className) .. name .. "|r added to inbox.")
             UpdateInboxTabLabel()
@@ -4107,7 +4667,7 @@ local function ScanGroupMembers()
         if isFirstScan then
             -- I just joined a group — all known players are "already here"
             if db.settings.alertOnMeJoin then
-                FireAlert(knownPlayers, "|cFFFFFFFFKnown players in your group:|r", false)
+                FireAlert(knownPlayers, T.white .. "Known players in your group:|r", false)
             end
         else
             -- Ongoing group: detect joins and leaves
@@ -4120,7 +4680,7 @@ local function ScanGroupMembers()
                     end
                 end
                 if #joined > 0 then
-                    FireAlert(joined, "|cFFFFFFFFKnown player joined your group:|r", false)
+                    FireAlert(joined, T.white .. "Known player joined your group:|r", false)
                 end
             end
 
@@ -4136,7 +4696,7 @@ local function ScanGroupMembers()
                     end
                 end
                 if #left > 0 then
-                    FireAlert(left, "|cFFAAAAAAKnown player left your group:|r", true)
+                    FireAlert(left, T.muted .. "Known player left your group:|r", true)
                 end
             end
         end
@@ -4180,6 +4740,77 @@ end)
 D("auto-tracking system OK")
 
 ----------------------------------------------------------------------
+-- Unit right-click menu integration
+--
+-- Adds a "WTFAY: Rate / Note" entry to Blizzard's unit dropdowns so a
+-- player can be rated straight from a raid frame, a chat name, or the
+-- friends list instead of targeting them and typing a slash command.
+--
+-- Two completely different APIs underneath (Menu.ModifyMenu on Mainline,
+-- UnitPopupMenus on Classic) - the compat layer picks one and calls us back
+-- with a plain name/realm/unit.
+----------------------------------------------------------------------
+do
+    local menuOK, menuErr, impl = C.RegisterUnitMenu(
+        "WTFAY: Rate / Note",
+        function(name, realm, unit)
+            if not db or not db.players then return end
+            if not name or name == "" then return end
+
+            local myName = C.UnitIdentity("player")
+            if myName and name == myName then
+                P("You can't rate yourself.")
+                return
+            end
+
+            -- Read what we can off the unit; a chat/friends-list entry has none.
+            local className, raceName, level
+            if unit and UnitExists(unit) and UnitIsPlayer(unit) then
+                local _, classFile = UnitClass(unit)
+                if classFile then className = TitleCase(classFile) end
+                raceName = UnitRace(unit)
+                level    = UnitLevel(unit)
+            end
+
+            local key = MakeKey(name, realm)
+            local p   = db.players[key]
+            if not p then
+                local realmNorm = NormalizeRealm(realm)
+                if realmNorm == "" then realmNorm = C.MyRealm() end
+                if realmNorm == "" and C.UsesRealms then realmNorm = "Unknown" end
+                p = {
+                    name   = TitleCase(name), realm = realmNorm,
+                    class  = className or "Unknown", race = raceName or "",
+                    level  = level or 0, rating = 0, note = "",
+                    source = "manual", seen = Timestamp(), encounters = {},
+                }
+                db.players[key] = p
+                -- A chat or friends-list entry has no unit, so no location for them.
+                LogEncounter(key, "manual", nil, level, not (unit and UnitExists(unit)))
+                P("Added " .. ClassColor(p.class) .. p.name .. "|r from the unit menu.")
+                if (p.class or "Unknown") == "Unknown" and WhoEnrich and db.settings.whoEnrich then
+                    WhoEnrich(key, false)
+                end
+            else
+                if className and className ~= "" then p.class = className end
+                if raceName and raceName ~= "" then p.race  = raceName end
+                if level and level > (p.level or 0) then p.level = level end
+            end
+
+            RefreshList()
+            if ShowRatingPicker then ShowRatingPicker(key) end
+        end,
+        function() return db and db.settings and db.settings.unitMenu end
+    )
+
+    if menuOK then
+        D("unit menu integration OK via " .. tostring(impl))
+    else
+        D("unit menu setup FAILED: " .. tostring(menuErr))
+    end
+end
+
+----------------------------------------------------------------------
 -- Init
 ----------------------------------------------------------------------
 local loader = CreateFrame("Frame")
@@ -4195,11 +4826,21 @@ loader:SetScript("OnEvent", function(self, event, arg1)
             f:SetPoint(db.frame.point, UIParent, db.frame.relPoint, db.frame.x, db.frame.y)
         end
         if db.frame and db.frame.width then
-            f:SetSize(db.frame.width, db.frame.height)
+            -- Clamp: sizes saved under older, smaller bounds would squeeze the
+            -- fixed columns past the Name column and break the list layout.
+            local w = math.max(MIN_W, math.min(MAX_W, db.frame.width or MIN_W))
+            local h = math.max(MIN_H, math.min(MAX_H, db.frame.height or MIN_H))
+            f:SetSize(w, h)
+            db.frame.width, db.frame.height = w, h
         end
 
         -- Restore settings
         DEBUG = db.settings.debug
+
+        -- Window style: repaints every registered window, tab and border, and
+        -- re-runs the main layout (bottom tabs vs pills).
+        local skin = db.settings.skin
+        C.SetSkin((skin == "native" or skin == "dark") and skin or C.DefaultSkin())
 
         -- Restore minimap button position and visibility
         if db.minimapAngle then
@@ -4231,7 +4872,7 @@ loader:SetScript("OnEvent", function(self, event, arg1)
             settingsPanel.RegisterBliz()
         end
 
-        P("v" .. ADDON_VERSION .. " loaded! Type |cFFFFD100/wtfay|r to open.  |cFFFFD100/wtfay help|r for commands.")
+        P("v" .. ADDON_VERSION .. " loaded! Type " .. T.gold .. "/wtfay|r to open.  " .. T.gold .. "/wtfay help|r for commands.")
         self:UnregisterAllEvents()
     end
 end)
@@ -4250,24 +4891,24 @@ AddTargetPlayer = function()
         return
     end
 
-    local name, realm = UnitName("target")
-    realm = (realm and realm ~= "") and realm or (GetRealmName() or "Unknown")
+    local name, realm = C.UnitIdentity("target")
+    if not name then P("Could not read your target's name."); return end
 
     local _, classFile = UnitClass("target")
-    local className = classFile and (classFile:sub(1,1):upper() .. classFile:sub(2):lower()) or "Unknown"
+    local className = classFile and TitleCase(classFile) or "Unknown"
 
     local raceName = UnitRace("target") or ""
 
     local level = UnitLevel("target") or 0
 
     if not db then return end
-    local key = name .. "-" .. realm
+    local key = MakeKey(name, realm)
     if db.players[key] then
         db.players[key].seen  = Timestamp()
         db.players[key].class = className
         db.players[key].race  = raceName
         if level > 0 then db.players[key].level = level end
-        LogEncounter(key, "manual")
+        LogEncounter(key, "manual", nil, level)
         P("Updated " .. ClassColor(className) .. name .. "|r (already tracked)")
     else
         db.players[key] = {
@@ -4282,7 +4923,7 @@ AddTargetPlayer = function()
             seen       = Timestamp(),
             encounters = {},
         }
-        LogEncounter(key, "manual")
+        LogEncounter(key, "manual", nil, level)
         P("Added " .. ClassColor(className) .. name .. "|r (" .. raceName .. " " .. className .. ")")
     end
     RefreshList()
@@ -4292,48 +4933,40 @@ end
 -- Tooltip integration: show WTFAY info on player tooltips
 ----------------------------------------------------------------------
 D("setting up tooltip hook...")
-local tooltipOK, tooltipErr = pcall(function()
-    local function OnTooltipSetUnit(tooltip)
-        if not db or not db.players then return end
-        local _, unit = tooltip:GetUnit()
-        if not unit or not UnitIsPlayer(unit) then return end
 
-        local name, realm = UnitName(unit)
-        realm = (realm and realm ~= "") and realm or (GetRealmName() or "Unknown")
-        local key = name .. "-" .. realm
+-- The compat layer decides how to hook (TooltipDataProcessor on Mainline,
+-- OnTooltipSetUnit on Classic) and hands us a resolved unit token.
+local tooltipOK, tooltipErr = C.HookUnitTooltip(function(tooltip, unit)
+    if not db or not db.players then return end
+    if not (db.settings and db.settings.tooltipEnabled) then return end
+    if not UnitIsPlayer(unit) then return end
 
-        local p = db.players[key]
-        if p then
-            tooltip:AddLine(" ")
-            tooltip:AddDoubleLine(
-                "|cFF" .. ACCENT .. "WTFAY|r",
-                ColorRating(p.rating or 0) .. " " .. (RATING_LABELS[p.rating or 0] or "")
-            )
-            if p.note and p.note ~= "" then
-                tooltip:AddLine("|cFFDDDDDD" .. p.note .. "|r", 1, 1, 1, true)
-            end
-            tooltip:AddLine("|cFF666666" .. (p.source or "manual") .. " - " .. (p.seen or "") .. "|r")
-        else
-            -- Hint to add unknown players
-            tooltip:AddLine("|cFF" .. ACCENT .. "WTFAY|r |cFF888888- /wtfay target to track|r")
+    local key = UnitKey(unit)
+    if not key then return end
+
+    local p = db.players[key]
+    if p then
+        tooltip:AddLine(" ")
+        tooltip:AddDoubleLine(
+            "|cFF" .. ACCENT .. "WTFAY|r",
+            C.RatingIcon(p.rating or 0) .. ColorRating(p.rating or 0) .. " " .. (RATING_LABELS[p.rating or 0] or "")
+        )
+        if p.note and p.note ~= "" then
+            tooltip:AddLine(T.text .. p.note .. "|r", 1, 1, 1, true)
         end
-        tooltip:Show()
-    end
-
-    -- Hook GameTooltip
-    if GameTooltip and GameTooltip.HookScript then
-        GameTooltip:HookScript("OnTooltipSetUnit", OnTooltipSetUnit)
-        D("hooked GameTooltip:OnTooltipSetUnit OK")
-    elseif GameTooltip and GameTooltip:GetScript("OnTooltipSetUnit") then
-        local orig = GameTooltip:GetScript("OnTooltipSetUnit")
-        GameTooltip:SetScript("OnTooltipSetUnit", function(self, ...)
-            if orig then orig(self, ...) end
-            OnTooltipSetUnit(self)
-        end)
-        D("wrapped GameTooltip:OnTooltipSetUnit OK")
+        if db.settings.tooltipGuild and p.guild and p.guild ~= "" then
+            tooltip:AddLine(T.guild .. "<" .. p.guild .. ">|r")
+        end
+        local met = MetLineFor(p)
+        if met then tooltip:AddLine(T.brass .. met .. "|r") end
+        tooltip:AddLine(T.faint .. (p.source or "manual") .. " - " .. (p.seen or "") .. "|r")
+    elseif db.settings.tooltipHint then
+        tooltip:AddLine("|cFF" .. ACCENT .. "WTFAY|r " .. T.dim .. "- /wtfay target to track|r")
     else
-        D("WARNING: could not hook GameTooltip")
+        -- Unknown player and the hint is off: leave the tooltip untouched.
+        return
     end
+    tooltip:Show()
 end)
 
 if tooltipOK then

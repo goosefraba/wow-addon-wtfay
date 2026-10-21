@@ -1,0 +1,10 @@
+package-as: WTFAY
+
+ignore:
+  - .gitignore
+  - .github
+  - .agents
+  - .claude
+  - .codex
+  - AGENTS.md
+  - CLAUDE.md

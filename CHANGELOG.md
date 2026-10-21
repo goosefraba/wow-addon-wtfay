@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.8.0
+
+### New Features
+- Added WoW Forever and Midnight compatibility alongside TBC Anniversary through a shared client compatibility layer.
+- Added support for Forever character surnames, client-specific player keys, and migration of existing saved player data.
+- Added native game window styling on modern clients, a live-switchable dark style, and an Addon Compartment entry.
+- Added optional player detail enrichment via `/who`, tooltip options, and a rate/note entry in supported player context menus.
+- Expanded encounter details with location and level information, including where you first met a player.
+
+### UI
+- Moved configuration into a Settings tab in the main window, alongside Database and Inbox, with scrollable General, Alerts, and Display sections.
+- Added Back navigation to the preceding tab; settings shortcuts now open the embedded configuration.
+- Updated modern-client player lists with native scrolling, improved column alignment, and mouse-wheel support.
+- Kept the in-game AddOns settings page synchronized with every addon setting and added right-click reset for toggles.
+
+### Compatibility
+- Updated manifests for WoW Forever (16001), Midnight (120100), and TBC Anniversary (20506).
+- Isolated client-specific menus, tooltips, settings registration, and protected-value handling in `Compat.lua`.
+
 ## v0.7.1
 
 ### Compatibility

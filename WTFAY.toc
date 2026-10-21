@@ -1,8 +1,15 @@
-## Interface: 20506
+## Interface: 120100, 16001, 20506
+## Interface-BCC: 20506
 ## Title: WTFAY - Who The F* Are You?
 ## Notes: Track, rate, and remember every player you encounter.
 ## Author: goosefraba
-## Version: 0.7.1
+## X-Curse-Project-ID: 1463391
+## Version: 0.8.0
 ## SavedVariables: WTFAYDB
+## IconTexture: Interface\Icons\INV_Misc_Note_01
+## AddonCompartmentFunc: WTFAY_OnAddonCompartmentClick
+## AddonCompartmentFuncOnEnter: WTFAY_OnAddonCompartmentEnter
+## AddonCompartmentFuncOnLeave: WTFAY_OnAddonCompartmentLeave
 
+Compat.lua
 WTFAY.lua

@@ -1,6 +1,6 @@
 # WTFAY - Who The F* Are You?
 
-A World of Warcraft addon for **TBC Classic / Anniversary Edition** (Interface 20505) that helps you track, rate, and remember every player you encounter.
+A World of Warcraft addon for **WoW Forever**, **TBC Anniversary**, and **Midnight / retail** that helps you track, rate, and remember every player you encounter.
 
 Never forget who you grouped with — rate players, leave notes, and build your own personal player database.
 
@@ -21,6 +21,8 @@ Never forget who you grouped with — rate players, leave notes, and build your 
 - **Tooltip Integration** — See player ratings and notes when hovering over players in-game
 - **Context Menu** — Right-click players in the list to whisper, invite, rate, edit notes, or remove
 - **Blizzard Settings Integration** — Settings available in Interface > AddOns > WTFAY
+- **Embedded Settings** — Configure General, Alerts, and Display options in the main window
+- **Native Window Style** — Use the game's window styling on modern clients, or switch to the dark style
 - **Help Panel** — In-app guide with tips and macro recommendations
 
 ## Installation
@@ -28,8 +30,9 @@ Never forget who you grouped with — rate players, leave notes, and build your 
 1. Download the latest release zip file
 2. Extract the `WTFAY` folder into your WoW AddOns directory:
    ```
-   World of Warcraft/_anniversary_/Interface/AddOns/WTFAY/
+   World of Warcraft/_classic_beta_/Interface/AddOns/WTFAY/
    ```
+   Use your client's folder instead, such as `_anniversary_` for TBC or `_retail_` for Midnight.
 3. Restart WoW or type `/reload` if already in-game
 4. The addon will load with sample data so you can explore the UI right away
 
@@ -85,7 +88,7 @@ Put this on your action bar — target a player and click to instantly add them 
 
 ## Settings
 
-Access via the **Settings** button, `/wtfay settings`, or **Interface > AddOns > WTFAY**:
+Access via the **Settings** tab in the main window, `/wtfay settings`, or **Interface > AddOns > WTFAY**. Settings stay inside the main window, with scrollable General, Alerts, and Display sections. Changes apply immediately.
 
 - **Debug Logging** — Show verbose debug messages (off by default)
 - **Auto-Track Party Members** — Automatically track players you group with (on by default)
@@ -93,7 +96,9 @@ Access via the **Settings** button, `/wtfay settings`, or **Interface > AddOns >
 
 ## Compatibility
 
-- **Interface**: 20505 (TBC Classic / Anniversary Edition, Patch 2.5.5)
+- **WoW Forever**: Interface 16001 (beta client: `_classic_beta_`)
+- **TBC Anniversary**: Interface 20506 (`_anniversary_`)
+- **Midnight / retail**: Interface 120100 (`_retail_`)
 - **SavedVariables**: `WTFAYDB` (persists across sessions)
 
 ## Author
