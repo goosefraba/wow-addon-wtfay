@@ -4,7 +4,7 @@
 ## Notes: Track, rate, and remember every player you encounter.
 ## Author: goosefraba
 ## X-Curse-Project-ID: 1463391
-## Version: 0.8.0
+## Version: 0.8.1
 ## SavedVariables: WTFAYDB
 ## IconTexture: Interface\Icons\INV_Misc_Note_01
 ## AddonCompartmentFunc: WTFAY_OnAddonCompartmentClick

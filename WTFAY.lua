@@ -1,5 +1,5 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.8.0
+-- WTFAY - Who The F* Are You?   v0.8.1
 -- Database, slash commands, browse UI, rating, notes
 --
 -- Multi-flavor: TBC Anniversary (20506), WoW Forever (16001) and Midnight
@@ -10,7 +10,7 @@ local ADDON_NAME, ns = ...
 local C = ns.C
 local T = C.T   -- text colour tokens; never write a raw |cFF literal
 
-local ADDON_VERSION = "0.8.0"
+local ADDON_VERSION = "0.8.1"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED

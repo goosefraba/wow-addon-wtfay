@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.8.1
+
+### Compatibility
+- Re-release for the WoW Forever launch (1.60.1, Interface 16001). No functional changes since v0.8.0.
+
 ## v0.8.0
 
 ### New Features
