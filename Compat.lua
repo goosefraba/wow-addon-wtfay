@@ -134,6 +134,17 @@ function C.UnitKey(unit)
     return C.MakeKey(name, realm), name, realm
 end
 
+-- The group role the game reports for a unit: "TANK", "HEALER", "DAMAGER", or
+-- nil when it reports none. Never guessed from class. TBC's dungeon finder
+-- sets roles; without it UnitGroupRolesAssigned says "NONE" (or doesn't exist).
+function C.UnitRole(unit)
+    if not unit or type(UnitGroupRolesAssigned) ~= "function" then return nil end
+    local ok, role = pcall(UnitGroupRolesAssigned, unit)
+    if not ok or role == nil or issecret(role) then return nil end
+    if role == "TANK" or role == "HEALER" or role == "DAMAGER" then return role end
+    return nil
+end
+
 ----------------------------------------------------------------------
 -- Class colors
 --
@@ -279,7 +290,8 @@ end
 --           UnitPopup_OnClick family was removed in 11.0.
 -- Classic:  load-time insert into UnitPopupMenus + secure post-hooks.
 --
--- callback(name, realm, unit); isEnabled() gates the entry.
+-- callback(name, realm, unit); isEnabled() gates the entry. label is a string, or
+-- label(name, realm) -> text, asked again each time the menu opens.
 ----------------------------------------------------------------------
 local MAINLINE_MENU_TAGS = {
     "MENU_UNIT_PLAYER", "MENU_UNIT_PARTY", "MENU_UNIT_RAID_PLAYER",
@@ -297,6 +309,10 @@ local CLASSIC_BUTTON = "WTFAY_RATE"
 function C.RegisterUnitMenu(label, callback, isEnabled)
     local function enabled()
         return (not isEnabled) or isEnabled()
+    end
+    local function text(name, realm)
+        if type(label) == "function" then return label(name, realm) end
+        return label
     end
 
     ------------------------------------------------------------------
@@ -317,7 +333,7 @@ function C.RegisterUnitMenu(label, callback, isEnabled)
 
             rootDescription:CreateDivider()
             rootDescription:CreateTitle("WTFAY")
-            rootDescription:CreateButton(label, function()
+            rootDescription:CreateButton(text(name, contextData.server), function()
                 callback(name, contextData.server, contextData.unit)
             end)
         end
@@ -333,11 +349,31 @@ function C.RegisterUnitMenu(label, callback, isEnabled)
     ------------------------------------------------------------------
     -- Classic
     ------------------------------------------------------------------
+    -- Who the open dropdown is for.
+    local function DropdownTarget()
+        local dropdown = UIDROPDOWNMENU_INIT_MENU
+        if not dropdown then return end
+        local name, realm, unit = nil, nil, dropdown.unit
+        if unit and UnitExists(unit) and UnitIsPlayer(unit) then
+            name, realm = UnitName(unit)
+        else
+            name, realm = dropdown.name, dropdown.server
+        end
+        if not name or name == "" then return end
+        -- Some dropdowns put "Name-Realm" in the name field alone.
+        if not realm or realm == "" then
+            local n2, r2 = name:match("^([^%-]+)%-(.+)$")
+            if n2 then name, realm = n2, r2 end
+        end
+        return name, realm, unit
+    end
+
     local ok, err = pcall(function()
         if not UnitPopupButtons or not UnitPopupMenus then return end
         if type(UnitPopup_OnClick) ~= "function" then return end
 
-        UnitPopupButtons[CLASSIC_BUTTON] = { text = label, dist = 0 }
+        -- No title row here, so the entry names the addon itself.
+        UnitPopupButtons[CLASSIC_BUTTON] = { text = "WTFAY: " .. text(), dist = 0 }
 
         for _, menuName in ipairs(CLASSIC_MENUS) do
             local menu = UnitPopupMenus[menuName]
@@ -352,10 +388,15 @@ function C.RegisterUnitMenu(label, callback, isEnabled)
             end
         end
 
-        -- Hide the entry when disabled, without needing a reload.
+        -- Runs before the entries are drawn: relabel the entry for this player,
+        -- or hide it when disabled, without needing a reload.
         if UnitPopupShown and type(UnitPopup_HideButtons) == "function" then
             hooksecurefunc("UnitPopup_HideButtons", function()
-                if enabled() then return end
+                if enabled() then
+                    local name, realm = DropdownTarget()
+                    UnitPopupButtons[CLASSIC_BUTTON].text = "WTFAY: " .. text(name, realm)
+                    return
+                end
                 local dropdown = UIDROPDOWNMENU_INIT_MENU
                 local which    = dropdown and dropdown.which
                 local menu     = which and UnitPopupMenus[which]
@@ -372,22 +413,8 @@ function C.RegisterUnitMenu(label, callback, isEnabled)
             if self.value ~= CLASSIC_BUTTON then return end
             if not enabled() then return end
 
-            local dropdown = UIDROPDOWNMENU_INIT_MENU
-            if not dropdown then return end
-
-            local name, realm, unit = nil, nil, dropdown.unit
-            if unit and UnitExists(unit) and UnitIsPlayer(unit) then
-                name, realm = UnitName(unit)
-            else
-                name, realm = dropdown.name, dropdown.server
-            end
-            if not name or name == "" then return end
-            -- Some dropdowns put "Name-Realm" in the name field alone.
-            if not realm or realm == "" then
-                local n2, r2 = name:match("^([^%-]+)%-(.+)$")
-                if n2 then name, realm = n2, r2 end
-            end
-            callback(name, realm, unit)
+            local name, realm, unit = DropdownTarget()
+            if name then callback(name, realm, unit) end
         end)
     end)
 

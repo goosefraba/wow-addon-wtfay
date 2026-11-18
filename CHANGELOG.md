@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.9.0
+
+### New Features
+- **Groups tab:** every group you've been in, with when, how long, where you went and who was there. Add a group note, show its players in the Database tab, or forget it. Regrouping with the same people within 30 minutes continues the same group.
+- **Rate your group:** when a group ends, a card lists everyone in it with a row of rating buttons. It waits until you're out of combat, says how to turn it off, and can also be opened with `/wtfay recap` or from the Groups tab. On by default (Settings > General).
+- **Tags and nicknames:** ten built-in tags (Good tank, Helpful, Run again, Ninja looter, ...) plus up to 20 of your own, which you can rename or delete; and a private nickname per player. They show in the list, detail panel and tooltips, and search finds them.
+- **One window to rate, tag and write a note:** the rating window now shows every tag as a button and has a note box, so it's no longer a two-step process.
+- **Roles:** the role the game reports (Tank / Healer / DPS) is saved with each encounter and shown in tooltips and the history. It is never guessed from class.
+- **Import preview:** before importing, see how many players are new, how many you already know (and how many of those are rated differently), and any lines that couldn't be read.
+- **New filters:** Last Group (everyone from your latest group, Inbox players included), tags, and last seen (7 / 30 days).
+- **Show Private Notes** (Settings > Display): hide notes, tags and nicknames from tooltips, for streaming.
+- The game's right-click menu entry now shows the rating you gave someone.
+
+### Changes
+- Battlegrounds and arenas are no longer recorded, so random PvP teams don't flood your Inbox.
+- Replace All on import now needs two clicks.
+- Closing the note editor without Save keeps what you typed as a draft; only Cancel throws it away.
+- Exports now include tags and nicknames. Older versions ignore them when importing.
+- New installs start with an empty database instead of example players.
+
+### Bug Fixes
+- Fixed duplicate encounter entries: moving between zones while grouped logged the same group again. Existing duplicates are merged automatically on first load.
+- Fixed the rating window's text being cut off by its buttons.
+
 ## v0.8.1
 
 ### Compatibility

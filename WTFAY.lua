@@ -1,5 +1,5 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.8.1
+-- WTFAY - Who The F* Are You?   v0.9.0
 -- Database, slash commands, browse UI, rating, notes
 --
 -- Multi-flavor: TBC Anniversary (20506), WoW Forever (16001) and Midnight
@@ -10,7 +10,7 @@ local ADDON_NAME, ns = ...
 local C = ns.C
 local T = C.T   -- text colour tokens; never write a raw |cFF literal
 
-local ADDON_VERSION = "0.8.1"
+local ADDON_VERSION = "0.9.0"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
@@ -110,20 +110,673 @@ D("helpers OK")
 ----------------------------------------------------------------------
 local db
 
-local SEED_PLAYERS = {
-    { name="Thrallgaze",   realm="Shazzrah",   class="Shaman",  race="Orc",      level=70, rating= 5, note="Great healer, always has totems down",   source="raid"    },
-    { name="Legolazz",     realm="Shazzrah",   class="Hunter",  race="Night Elf", level=70, rating=-2, note="Pulled half the dungeon on purpose",     source="dungeon" },
-    { name="Stabsworth",   realm="Shazzrah",   class="Rogue",   race="Undead",   level=68, rating= 3, note="Solid DPS, shared lockpicking",          source="group"   },
-    { name="Holysmokes",   realm="Shazzrah",   class="Priest",  race="Dwarf",    level=70, rating= 4, note="Clutch heals in Karazhan",               source="raid"    },
-    { name="Moonkindle",   realm="Shazzrah",   class="Druid",   race="Tauren",   level=69, rating= 0, note="",                                       source="dungeon" },
-    { name="Felcaster",    realm="Shazzrah",   class="Warlock", race="Gnome",    level=70, rating=-3, note="Lifetapped to death then blamed healer",  source="dungeon" },
-    { name="Shieldwall",   realm="Shazzrah",   class="Warrior", race="Human",    level=70, rating= 4, note="Great tank, marks targets",              source="raid"    },
-    { name="Froztbolt",    realm="Shazzrah",   class="Mage",    race="Troll",    level=66, rating= 1, note="Decent but kept pulling aggro",          source="group"   },
-    { name="Retbull",      realm="Shazzrah",   class="Paladin", race="Blood Elf", level=70, rating= 2, note="Off-tank, wings are flashy",             source="raid"    },
-    { name="Sneakypete",   realm="Shazzrah",   class="Rogue",   race="Blood Elf", level=70, rating=-1, note="Rolled need on healer gear",             source="dungeon" },
-    { name="Natureboi",    realm="Shazzrah",   class="Druid",   race="Night Elf", level=70, rating= 5, note="Best resto druid on the server",         source="raid"    },
-    { name="Zugzug",       realm="Shazzrah",   class="Warrior", race="Orc",      level=64, rating= 0, note="",                                       source="manual"  },
-}
+----------------------------------------------------------------------
+-- People: several characters, one player
+--
+-- Each character keeps its own record; a character that's been linked also
+-- carries p.personId, pointing at db.people[id]:
+--     { main = key, members = { key, ... }, rating = n, rated = bool }
+--
+-- A person owns the RATING, so a blacklist follows the player onto their alts.
+-- Always read it with People.Rating(p) and write it with People.SetRating(p, v).
+-- The character's own p.rating is left alone while linked, which is what lets
+-- Unlink undo a mistaken link: the character simply gets its own rating back.
+-- Notes, encounters, level and class stay on the character.
+--
+-- WoW has no API that reveals another player's alts, so links only ever come
+-- from the user.
+----------------------------------------------------------------------
+local People = {}
+do
+    -- A blacklist always wins, so linking can never lose one (plain "larger
+    -- absolute value" would let +5 beat -3). Otherwise the stronger opinion
+    -- wins, and a tie goes to the lower rating.
+    local function CombineRatings(a, b)
+        a, b = a or 0, b or 0
+        if a <= -3 or b <= -3 then return math.min(a, b) end
+        local absA, absB = math.abs(a), math.abs(b)
+        if absA ~= absB then return absA > absB and a or b end
+        return math.min(a, b)
+    end
+    People.CombineRatings = CombineRatings
+
+    function People.Of(p)
+        local id = p and p.personId
+        return id and db and db.people and db.people[id] or nil
+    end
+
+    function People.Rating(p)
+        local person = People.Of(p)
+        if person then return person.rating or 0 end
+        return p and p.rating or 0
+    end
+
+    function People.SetRating(p, value)
+        local person = People.Of(p)
+        if person then
+            person.rating = value
+            person.rated = true   -- a deliberate opinion of the person; see Settle
+        else
+            p.rating = value
+        end
+    end
+
+    function People.IsMain(p)
+        local person = People.Of(p)
+        return person ~= nil and db.players[person.main] == p
+    end
+
+    -- The other characters of this player, main first. Returns records and,
+    -- in parallel, their keys.
+    function People.Others(p)
+        local records, keys = {}, {}
+        local person = People.Of(p)
+        if not person then return records, keys end
+        local main = db.players[person.main]
+        if main and main ~= p then
+            records[1], keys[1] = main, person.main
+        end
+        for _, k in ipairs(person.members) do
+            local m = db.players[k]
+            if m and m ~= p and m ~= main then
+                records[#records + 1], keys[#keys + 1] = m, k
+            end
+        end
+        return records, keys
+    end
+
+    -- Short label for lists: "alt of Felcaster" or "+2 alts". Nil if unlinked.
+    function People.Tag(p)
+        local others = People.Others(p)
+        if #others == 0 then return nil end
+        if People.IsMain(p) then
+            return "+" .. #others .. (#others == 1 and " alt" or " alts")
+        end
+        return "alt of " .. others[1].name
+    end
+
+    -- Full sentence for tooltips, with class-coloured names. Nil if unlinked.
+    function People.Line(p)
+        local others = People.Others(p)
+        if #others == 0 then return nil end
+        local MAX_NAMES = 4
+        local names = {}
+        for i = 1, math.min(#others, MAX_NAMES) do
+            names[i] = ClassColor(others[i].class) .. others[i].name .. "|r"
+        end
+        local more = (#others > MAX_NAMES) and (" +" .. (#others - MAX_NAMES) .. " more") or ""
+        if People.IsMain(p) then
+            return "Also plays " .. table.concat(names, ", ") .. more
+        end
+        local line = "Alt of " .. table.remove(names, 1)
+        if #names > 0 then line = line .. ", also " .. table.concat(names, ", ") end
+        return line .. more
+    end
+
+    -- Notes on this player's other characters: { { name =, note = }, ... }
+    function People.OtherNotes(p)
+        local out = {}
+        for _, m in ipairs((People.Others(p))) do
+            if m.note and m.note ~= "" then
+                out[#out + 1] = { name = m.name, note = m.note }
+            end
+        end
+        return out
+    end
+
+    -- One note for one-line displays: their own, else one from another
+    -- character. Returns the note and, if borrowed, whose it was.
+    function People.BestNote(p)
+        if p.note and p.note ~= "" then return p.note, nil end
+        local first = People.OtherNotes(p)[1]
+        if first then return first.note, first.name end
+        return nil, nil
+    end
+
+    -- Person ids with a member whose name contains text (already lower-case),
+    -- so searching for a main also finds their alts.
+    function People.NameHits(text)
+        local hits = {}
+        for id, person in pairs(db and db.people or {}) do
+            for _, k in ipairs(person.members) do
+                local m = db.players[k]
+                if m and m.name and m.name:lower():find(text, 1, true) then
+                    hits[id] = true
+                    break
+                end
+            end
+        end
+        return hits
+    end
+
+    -- Encounters oldest first. Linked: merged across the person's characters,
+    -- plus an entry -> owning record map. Unlinked: their own list and nil.
+    function People.Encounters(p)
+        if not p then return {}, nil end
+        local person = People.Of(p)
+        if not person then return p.encounters or {}, nil end
+        local merged, owners = {}, {}
+        for _, k in ipairs(person.members) do
+            local m = db.players[k]
+            for _, e in ipairs(m and m.encounters or {}) do
+                merged[#merged + 1] = e
+                owners[e] = m
+            end
+        end
+        table.sort(merged, function(a, b)
+            local ta, tb = a.time or "", b.time or ""
+            if ta ~= tb then return ta < tb end
+            local sa, sb = a._ts or 0, b._ts or 0
+            if sa ~= sb then return sa < sb end
+            return (owners[a].name or "") < (owners[b].name or "")
+        end)
+        return merged, owners
+    end
+
+    -- How many characters beyond the first each player accounts for, i.e.
+    -- character count minus this equals the number of people.
+    function People.ExtraCharacters()
+        local extra = 0
+        for _, person in pairs(db and db.people or {}) do
+            extra = extra + math.max(0, #person.members - 1)
+        end
+        return extra
+    end
+
+    -- Resolve typed input to a key: exact match first, then a name (or, on
+    -- Forever, a first name) that only one tracked character has.
+    function People.Find(input)
+        if not input or not db then return nil end
+        local name, realm = SplitNameRealm(input)
+        if not name or name == "" then return nil end
+        local key = MakeKey(name, realm)
+        if db.players[key] then return key end
+        local wanted, found = input:trim():lower(), nil
+        for k, p in pairs(db.players) do
+            local n = (p.name or ""):lower()
+            if n == wanted or n:sub(1, #wanted + 1) == wanted .. " " then
+                if found then return nil end   -- ambiguous
+                found = k
+            end
+        end
+        return found
+    end
+
+    -- Keep a person consistent after its members changed. One member left means
+    -- there's no group any more. That member keeps its own rating, unless the
+    -- person was deliberately rated while linked: then that opinion carries on.
+    local function Settle(id, person)
+        if #person.members >= 2 then
+            local mainOK = false
+            for _, k in ipairs(person.members) do
+                if k == person.main then mainOK = true end
+            end
+            if not mainOK then person.main = person.members[1] end
+            return
+        end
+        local last = person.members[1] and db.players[person.members[1]]
+        if last then
+            last.personId = nil
+            if person.rated then last.rating = person.rating end
+        end
+        db.people[id] = nil
+    end
+
+    -- Link a character (and anyone already linked to it) to a target. The
+    -- target's person survives, so its main stays; a new person's main is the
+    -- target. Returns true, or false and a reason.
+    function People.Link(key, targetKey)
+        local a, b = db.players[key], db.players[targetKey]
+        if not a or not b then return false, "not found" end
+        if key == targetKey or a == b then return false, "same character" end
+        if a.personId and a.personId == b.personId then return false, "already linked" end
+
+        local targetId = b.personId
+        local person = People.Of(b)
+        if not person then
+            db.peopleSeq = (db.peopleSeq or 0) + 1
+            targetId = "p" .. db.peopleSeq
+            person = { main = targetKey, members = { targetKey }, rating = b.rating or 0 }
+            db.people[targetId] = person
+            b.personId = targetId
+        end
+
+        local incoming = People.Of(a)
+        local incomingRating = People.Rating(a)
+        local incomingKeys = incoming and incoming.members or { key }
+        for _, k in ipairs(incomingKeys) do
+            db.players[k].personId = targetId
+            person.members[#person.members + 1] = k
+        end
+        if incoming then
+            person.rated = person.rated or incoming.rated
+            for id, candidate in pairs(db.people) do
+                if candidate == incoming then db.people[id] = nil; break end
+            end
+        end
+        person.rating = CombineRatings(person.rating, incomingRating)
+
+        -- Knowing who they are is a decision about them, like rating them is,
+        -- so linked characters leave the Inbox.
+        for _, k in ipairs(person.members) do
+            db.players[k].pending = nil
+        end
+        return true
+    end
+
+    -- Remove a character from its person. Used for Unlink, and before a
+    -- character is deleted. Its own rating, kept all along, applies again.
+    function People.Unlink(key)
+        local p = db and db.players[key]
+        local id = p and p.personId
+        local person = id and db.people and db.people[id]
+        if p then p.personId = nil end
+        if not person then return false end
+        for i, k in ipairs(person.members) do
+            if k == key then table.remove(person.members, i); break end
+        end
+        Settle(id, person)
+        return true
+    end
+
+    function People.SetMain(key)
+        local person = People.Of(db and db.players[key])
+        if not person then return false end
+        person.main = key
+        return true
+    end
+
+    -- Make links and records agree after anything that rewrites db.players
+    -- wholesale (load, reset, import, restore).
+    function People.Reconcile()
+        if not db then return end
+        if not db.people then db.people = {} end
+        for id, person in pairs(db.people) do
+            local kept = {}
+            for _, k in ipairs(person.members or {}) do
+                local m = db.players[k]
+                if m and m.personId == id then kept[#kept + 1] = k end
+            end
+            person.members = kept
+            Settle(id, person)
+        end
+        local listed = {}
+        for _, person in pairs(db.people) do
+            for _, k in ipairs(person.members) do listed[k] = true end
+        end
+        for k, m in pairs(db.players) do
+            if m.personId and not listed[k] then m.personId = nil end
+        end
+    end
+
+    -- Deep copy of the links, for the Replace All backup.
+    function People.Snapshot()
+        local copy = {}
+        for id, person in pairs(db and db.people or {}) do
+            local members = {}
+            for i, k in ipairs(person.members) do members[i] = k end
+            copy[id] = { main = person.main, members = members, rating = person.rating, rated = person.rated }
+        end
+        return copy
+    end
+
+    -- Replaced by the UI once the list and detail panel exist.
+    function People.Changed() end
+
+    -- Link and tell the user, including the rating they now share.
+    function People.LinkAndReport(key, targetKey)
+        local ok, why = People.Link(key, targetKey)
+        local a, b = db.players[key], db.players[targetKey]
+        if not ok then
+            if why == "already linked" then
+                P(a.name .. " and " .. b.name .. " are already the same player.")
+            elseif why == "same character" then
+                P("A character can't be linked to itself.")
+            end
+            return false
+        end
+        P(ClassColor(a.class) .. a.name .. "|r is now linked to " .. ClassColor(b.class) .. b.name
+          .. "|r (same player, rated " .. ColorRating(People.Rating(a)) .. ").")
+        People.Changed()
+        return true
+    end
+
+    function People.UnlinkAndReport(key)
+        local p = db.players[key]
+        if not People.Of(p) then
+            P(p.name .. " isn't linked to anyone.")
+            return false
+        end
+        People.Unlink(key)
+        P(ClassColor(p.class) .. p.name .. "|r is no longer linked (rated " .. ColorRating(People.Rating(p)) .. ").")
+        People.Changed()
+        return true
+    end
+end
+
+----------------------------------------------------------------------
+-- Tags and nicknames
+--
+-- p.tags = { ["Run again"] = true, ... } and p.nick live on the character,
+-- like notes, so Unlink leaves each character its own. Displays and the tag
+-- filter use the whole player's: a linked character shows its alts' tags.
+-- Tag names come from Tags.PRESETS plus db.customTags (up to MAX_CUSTOM).
+-- Tags, nicknames and notes are private: the tooltip shows them only while
+-- db.settings.tooltipNotes is on.
+----------------------------------------------------------------------
+local Tags = {}
+do
+    Tags.PRESETS = {
+        "Good tank", "Good healer", "Good DPS", "Helpful", "Quest buddy",
+        "Run again", "Knows the fights", "AFK", "Ninja looter", "Rude",
+    }
+    Tags.MAX_CUSTOM = 20
+    Tags.MAX_LEN = 24
+
+    function Tags.All()
+        local out = {}
+        for _, t in ipairs(Tags.PRESETS) do out[#out + 1] = t end
+        for _, t in ipairs(db and db.customTags or {}) do out[#out + 1] = t end
+        return out
+    end
+
+    function Tags.IsCustom(name)
+        for _, t in ipairs(db and db.customTags or {}) do
+            if t == name then return true end
+        end
+        return false
+    end
+
+    -- Existing tag with this name, ignoring case.
+    local function Existing(name)
+        local lower = name:lower()
+        for _, t in ipairs(Tags.All()) do
+            if t:lower() == lower then return t end
+        end
+        return nil
+    end
+
+    -- Sorted list and set of the player's tags, across linked characters.
+    function Tags.Of(p)
+        local set = {}
+        for t in pairs(p and p.tags or {}) do set[t] = true end
+        if p then
+            for _, m in ipairs((People.Others(p))) do
+                for t in pairs(m.tags or {}) do set[t] = true end
+            end
+        end
+        local list = {}
+        for t in pairs(set) do list[#list + 1] = t end
+        table.sort(list)
+        return list, set
+    end
+
+    -- "Run again, Good tank", or nil.
+    function Tags.Text(p)
+        local list = Tags.Of(p)
+        if #list == 0 then return nil end
+        return table.concat(list, ", ")
+    end
+
+    -- Set or clear one tag on this character. Tagging someone is a decision
+    -- about them, like rating them, so they leave the Inbox.
+    function Tags.Set(p, name, on)
+        p.tags = p.tags or {}
+        p.tags[name] = on and true or nil
+        if not next(p.tags) then p.tags = nil end
+        if on then p.pending = nil end
+    end
+
+    Tags.Find = Existing
+
+    -- No pipes (WoW escapes), tabs (export separator) or commas (they
+    -- separate tags in an export).
+    local function Clean(name)
+        name = (name or ""):gsub("[|\t\r\n,]", ""):trim()
+        return name
+    end
+
+    -- Returns the new tag, or nil and a reason.
+    function Tags.AddCustom(name)
+        name = Clean(name)
+        if name == "" then return nil, "empty" end
+        if #name > Tags.MAX_LEN then return nil, "too long (" .. Tags.MAX_LEN .. " letters at most)" end
+        if Existing(name) then return nil, "already exists" end
+        db.customTags = db.customTags or {}
+        if #db.customTags >= Tags.MAX_CUSTOM then return nil, "you already have " .. Tags.MAX_CUSTOM .. " custom tags" end
+        db.customTags[#db.customTags + 1] = name
+        return name
+    end
+
+    -- Rename a custom tag everywhere it's used. Returns true, or nil and a reason.
+    function Tags.Rename(old, new)
+        new = Clean(new)
+        if not Tags.IsCustom(old) then return nil, "only your own tags can be renamed" end
+        if new == "" then return nil, "empty" end
+        if #new > Tags.MAX_LEN then return nil, "too long (" .. Tags.MAX_LEN .. " letters at most)" end
+        local clash = Existing(new)
+        if clash and clash ~= old then return nil, "already exists" end
+        for i, t in ipairs(db.customTags) do
+            if t == old then db.customTags[i] = new end
+        end
+        for _, p in pairs(db.players) do
+            if p.tags and p.tags[old] then
+                p.tags[old] = nil
+                p.tags[new] = true
+            end
+        end
+        return true
+    end
+
+    -- Delete a custom tag and take it off everyone. Returns how many lost it.
+    function Tags.Remove(name)
+        for i, t in ipairs(db.customTags or {}) do
+            if t == name then table.remove(db.customTags, i); break end
+        end
+        local n = 0
+        for _, p in pairs(db.players) do
+            if p.tags and p.tags[name] then
+                Tags.Set(p, name, false)
+                n = n + 1
+            end
+        end
+        return n
+    end
+
+    -- Their nickname: this character's, else one from a linked character.
+    -- Returns the nickname and, if borrowed, whose it was.
+    function Tags.Nick(p)
+        if not p then return nil end
+        if p.nick and p.nick ~= "" then return p.nick, nil end
+        for _, m in ipairs((People.Others(p))) do
+            if m.nick and m.nick ~= "" then return m.nick, m.name end
+        end
+        return nil
+    end
+
+    function Tags.SetNick(p, nick)
+        nick = Clean(nick)
+        p.nick = (nick ~= "") and nick:sub(1, 32) or nil
+        if p.nick then p.pending = nil end
+    end
+end
+
+----------------------------------------------------------------------
+-- Groups ("outings"): one record per time you were grouped
+--
+-- db.outings[id] = { start, till, time, kind, zones = { ... },
+--                    members = { key, ... }, note }
+-- An outing spans everything you did with one group: questing across zones,
+-- then the dungeon. Each encounter logged during it carries e.outing = id, so
+-- a player's history can say who else was there. Battlegrounds and arenas are
+-- never recorded (see ScanGroupMembers).
+----------------------------------------------------------------------
+local Outings = {}
+do
+    local KIND_RANK = { group = 1, dungeon = 2, raid = 3 }
+    local MAX_OUTINGS = 300
+    local RESUME_SECONDS = 1800   -- matches LogEncounter's 30 minutes
+
+    Outings.currentId = nil   -- runtime only: the outing the current group belongs to
+
+    function Outings.Get(id)
+        return id and db and db.outings and db.outings[id] or nil
+    end
+
+    -- Ids, newest first.
+    function Outings.Sorted()
+        local ids = {}
+        for id in pairs(db and db.outings or {}) do ids[#ids + 1] = id end
+        table.sort(ids, function(a, b)
+            local sa, sb = db.outings[a].start or 0, db.outings[b].start or 0
+            if sa ~= sb then return sa > sb end
+            return a > b
+        end)
+        return ids
+    end
+
+    function Outings.Latest()
+        return Outings.Sorted()[1]
+    end
+
+    local function Prune()
+        local ids = Outings.Sorted()
+        for i = MAX_OUTINGS + 1, #ids do db.outings[ids[i]] = nil end
+    end
+
+    -- Called by every group scan with the set of keys in the group. Continues
+    -- the current outing; after a /reload, or regrouping within 30 minutes
+    -- with someone from the last one, resumes that; otherwise starts a new one.
+    -- Returns the outing id.
+    function Outings.Touch(keys, source, zone)
+        if not db then return nil end
+        db.outings = db.outings or {}
+        local now = time()
+        local o = Outings.Get(Outings.currentId)
+        if not o then
+            local last = Outings.Get(db.lastOuting)
+            local resume = false
+            if last and last.till and (now - last.till) < RESUME_SECONDS then
+                for _, k in ipairs(last.members) do
+                    if keys[k] then resume = true; break end
+                end
+            end
+            if resume then
+                o, Outings.currentId = last, db.lastOuting
+            else
+                db.outingSeq = (db.outingSeq or 0) + 1
+                local id = "g" .. db.outingSeq
+                o = { start = now, till = now, time = Timestamp(), kind = "group", zones = {}, members = {} }
+                db.outings[id] = o
+                db.lastOuting, Outings.currentId = id, id
+                Prune()
+            end
+        end
+        o.till = now
+        if (KIND_RANK[source] or 0) > (KIND_RANK[o.kind] or 0) then o.kind = source end
+        if zone and zone ~= "" then
+            local known = false
+            for _, z in ipairs(o.zones) do
+                if z == zone then known = true; break end
+            end
+            if not known then o.zones[#o.zones + 1] = zone end
+        end
+        local listed, fresh = {}, {}
+        for _, k in ipairs(o.members) do listed[k] = true end
+        for k in pairs(keys) do
+            if not listed[k] then fresh[#fresh + 1] = k end
+        end
+        table.sort(fresh)
+        for _, k in ipairs(fresh) do o.members[#o.members + 1] = k end
+        return Outings.currentId
+    end
+
+    -- You left the group. Returns the outing that ended and its id, unless
+    -- nobody was in it (then it's dropped).
+    function Outings.Close()
+        local id = Outings.currentId
+        Outings.currentId = nil
+        local o = Outings.Get(id)
+        if not o then return nil end
+        if #o.members == 0 then db.outings[id] = nil; return nil end
+        return o, id
+    end
+
+    function Outings.Forget(id)
+        if db and db.outings then db.outings[id] = nil end
+        if db and db.lastOuting == id then db.lastOuting = nil end
+        if Outings.currentId == id then Outings.currentId = nil end
+    end
+
+    -- "1h 12m", "25m", or "<1m".
+    function Outings.FormatDuration(seconds)
+        local mins = math.floor((seconds or 0) / 60)
+        if mins < 1 then return "<1m" end
+        if mins >= 60 then return string.format("%dh %02dm", math.floor(mins / 60), mins % 60) end
+        return mins .. "m"
+    end
+
+    function Outings.Duration(o)
+        return Outings.FormatDuration((o.till or o.start or 0) - (o.start or 0))
+    end
+
+    -- "Hillsbrad Foothills > City of Dalaran", at most `max` places.
+    function Outings.Where(o, max)
+        max = max or 3
+        local zones = o.zones or {}
+        if #zones == 0 then return "" end
+        local shown = {}
+        for i = 1, math.min(#zones, max) do shown[i] = zones[i] end
+        local text = table.concat(shown, " > ")
+        if #zones > max then text = text .. " +" .. (#zones - max) end
+        return text
+    end
+
+    -- Records of the members still in the database, minus `exceptKey` and
+    -- that player's linked characters. Returns records and keys in parallel.
+    function Outings.Members(o, exceptKey)
+        local records, keys = {}, {}
+        local except = exceptKey and db.players[exceptKey]
+        local exceptPerson = except and except.personId
+        for _, k in ipairs(o and o.members or {}) do
+            local m = db.players[k]
+            if m and k ~= exceptKey and not (exceptPerson and m.personId == exceptPerson) then
+                records[#records + 1], keys[#keys + 1] = m, k
+            end
+        end
+        return records, keys
+    end
+
+    -- "with Bob, Ann +2", class-coloured, or "" when they were alone with you.
+    function Outings.WithText(o, exceptKey, maxNames)
+        local others = Outings.Members(o, exceptKey)
+        if #others == 0 then return "" end
+        maxNames = maxNames or 3
+        local names = {}
+        for i = 1, math.min(#others, maxNames) do
+            names[i] = ClassColor(others[i].class) .. others[i].name .. "|r"
+        end
+        local more = (#others > maxNames) and (" +" .. (#others - maxNames)) or ""
+        return table.concat(names, ", ") .. more
+    end
+end
+
+-- How often the game reported each role for this player: "Tank x2, Healer",
+-- across their linked characters, or nil when it never did.
+local ROLE_LABELS = { TANK = "Tank", HEALER = "Healer", DAMAGER = "DPS" }
+function People.RoleSummary(p)
+    local counts = {}
+    for _, e in ipairs((People.Encounters(p))) do
+        if e.role and ROLE_LABELS[e.role] then counts[e.role] = (counts[e.role] or 0) + 1 end
+    end
+    local parts = {}
+    for _, role in ipairs({ "TANK", "HEALER", "DAMAGER" }) do
+        local n = counts[role]
+        if n then parts[#parts + 1] = ROLE_LABELS[role] .. (n > 1 and (" x" .. n) or "") end
+    end
+    if #parts == 0 then return nil end
+    return table.concat(parts, ", ")
+end
 
 -- Alert sound choices (name, soundID for normal, soundID for blacklisted)
 local ALERT_SOUNDS = {
@@ -153,6 +806,8 @@ local SETTINGS_DEFAULTS = {
     tooltipGuild     = true,   -- Show the guild name in the tooltip when known
     whoEnrich        = true,   -- Fill in missing class/level/guild via /who lookups
     unitMenu         = true,   -- Add a WTFAY entry to right-click unit menus
+    tooltipNotes     = true,   -- Show notes, tags and nicknames on player tooltips
+    groupRecap       = true,   -- After a group ends, show a card to rate who was in it
     skin             = "auto", -- "auto" (native on Mainline), "native" or "dark"
 }
 
@@ -173,6 +828,8 @@ local function InitDB()
     db = WTFAYDB
     if not db.players then db.players = {} end
     if not db.frame then db.frame = {} end
+    if not db.people then db.people = {} end
+    if not db.outings then db.outings = {} end
 
     -- Initialize settings with defaults (preserves existing values)
     if not db.settings then db.settings = {} end
@@ -182,8 +839,9 @@ local function InitDB()
 
     -- Migration: rekey players stored before realm normalization existed, so
     -- "Bob-Azjol Nerub" / "Bob-Azjol-Nerub" both become "Bob-AzjolNerub".
-    local DB_VERSION = 2
-    if (db.dbVersion or 1) < DB_VERSION then
+    local DB_VERSION = 3
+    local fromVersion = db.dbVersion or 1
+    if fromVersion < 2 then
         local function Richness(x)
             return (((x.rating or 0) ~= 0) and 2 or 0) + (((x.note or "") ~= "") and 1 or 0)
         end
@@ -212,68 +870,59 @@ local function InitDB()
             end
         end
         db.players = rekeyed
-        db.dbVersion = DB_VERSION
         if moved > 0 then D("DB migration: rekeyed " .. moved .. " player(s)") end
     end
 
-    -- Seed sample data on first install so the addon isn't empty
-    local SEED_VERSION = 4
-    if (db.seedVersion or 0) < SEED_VERSION then
-        local fakeEncounters = {
-            Thrallgaze  = { "raid", "raid", "raid", "raid", "raid", "dungeon", "raid", "raid" },
-            Legolazz    = { "dungeon", "dungeon" },
-            Stabsworth  = { "group", "dungeon", "group" },
-            Holysmokes  = { "raid", "raid", "raid", "raid", "dungeon", "raid" },
-            Moonkindle  = { "dungeon" },
-            Felcaster   = { "dungeon", "dungeon", "dungeon" },
-            Shieldwall  = { "raid", "raid", "raid", "raid", "raid", "raid", "raid", "raid", "raid", "raid" },
-            Froztbolt   = { "group", "group" },
-            Retbull     = { "raid", "raid", "raid" },
-            Sneakypete  = { "dungeon", "dungeon", "dungeon", "dungeon" },
-            Natureboi   = { "raid", "raid", "raid", "raid", "raid", "raid", "raid" },
-            Zugzug      = { "manual" },
-        }
-        for _, p in ipairs(SEED_PLAYERS) do
-            local key = MakeKey(p.name, p.realm)
-            local encounters = {}
-            local srcList = fakeEncounters[p.name] or { p.source }
-            for idx, src in ipairs(srcList) do
-                local daysAgo = (#srcList - idx) * 3 + math.random(0, 2)
-                encounters[#encounters + 1] = {
-                    time   = date("%Y-%m-%d %H:%M", time() - daysAgo * 86400 - math.random(0, 43200)),
-                    source = src,
-                }
-            end
-            db.players[key] = {
-                name       = p.name,
-                -- Forever has no realms; don't store one the key doesn't use.
-                realm      = C.UsesRealms and p.realm or "",
-                class      = p.class,
-                race       = p.race or "",
-                level      = p.level,
-                rating     = p.rating,
-                note       = p.note,
-                source     = p.source,
-                seen       = Timestamp(),
-                encounters = encounters,
-            }
+    -- Migration: up to v0.8.1 every zone you crossed while grouped logged a
+    -- new encounter, so one evening of questing together left a dozen lines.
+    -- Collapse them the way LogEncounter now records them: a grouped entry
+    -- within an hour of the previous one is the same outing, unless it's a
+    -- different instance (a dungeon run keeps its own line). The hour is
+    -- looser than the live 30 minutes because skipped scans left gaps.
+    if fromVersion < 3 then
+        local function Instanced(e)
+            return e.instance or (e.instance == nil and e.zone ~= nil)
         end
-        db.seedVersion = SEED_VERSION
-        db.seeded = true
+        local function Grouped(e) return not e.remote and e.source ~= "manual" end
+        local dropped = 0
+        for _, p in pairs(db.players) do
+            local enc = p.encounters
+            if type(enc) == "table" and #enc > 1 then
+                local kept, prev = {}, nil
+                for _, e in ipairs(enc) do
+                    local last = kept[#kept]
+                    if last and prev and Grouped(e) and Grouped(last)
+                       and e._ts and prev._ts and (e._ts - prev._ts) < 3600
+                       and (not Instanced(e) or (Instanced(last) and last.zone == e.zone)) then
+                        last.till = math.max(last.till or last._ts or 0, e._ts)
+                        if last.lvl == nil then last.lvl = e.lvl end
+                        dropped = dropped + 1
+                    else
+                        kept[#kept + 1] = e
+                    end
+                    prev = e
+                end
+                p.encounters = kept
+            end
+        end
+        if dropped > 0 then
+            P("Tidied encounter history: merged " .. dropped .. " duplicate entr"
+              .. (dropped == 1 and "y" or "ies") .. " from zoning while grouped.")
+        end
     end
-end
+    db.dbVersion = DB_VERSION
 
--- Reseed function (can be called from slash command)
-local function ReseedDB()
-    if not db then return end
-    db.seedVersion = 0
-    InitDB()
+    People.Reconcile()
 end
 
 -- Log an encounter for a player (appends to encounters list)
 -- zone is optional: e.g. "Karazhan", "Shattered Halls"
 local LogEncounter
 do
+    -- Logged by auto-tracking while grouped (not a manual add or add-by-name).
+    local function IsGroupEncounter(e)
+        return not e.remote and e.source ~= "manual"
+    end
     -- Where the player is right now: zone, subzone, and whether it's an instance.
     local function CurrentLocation()
         local inInstance = IsInInstance and IsInInstance()
@@ -298,7 +947,9 @@ do
     --   theirLevel their level right now, when there was a unit to read it from
     --   remote     true when they were added by name and weren't actually with
     --              you, so where you happened to be says nothing about them
-    LogEncounter = function(key, source, zone, theirLevel, remote)
+    --   continuing true when they were already in the group at the last scan
+    --   role       "TANK" / "HEALER" / "DAMAGER" as the game reported it, or nil
+    LogEncounter = function(key, source, zone, theirLevel, remote, continuing, role)
         local p = db and db.players[key]
         if not p then return end
         if not p.encounters then p.encounters = {} end
@@ -306,6 +957,7 @@ do
 
         local now = time()
         local effectiveSource = source or p.source or "manual"
+        local grouped = not remote and effectiveSource ~= "manual"
         local where, sub, instanced = nil, nil, false
         if not remote then
             local z, sz, inst = CurrentLocation()
@@ -316,17 +968,35 @@ do
         if sub == "" then sub = nil end
 
         -- Dedup:
-        --   Instanced: skip when the last encounter was the same source in the
-        --   same instance (wipes, corpse runs, reloads).
-        --   Open world: skip the same source within 30 minutes in the same zone,
-        --   so regrouping after a break, or meeting again somewhere new, counts.
+        --   Grouped (auto-tracking): one encounter per time you're together.
+        --   While still grouped -- `continuing`, or seen within the last 30
+        --   minutes (`till`, which covers reloads) -- wandering through zones
+        --   just extends the last entry. Only entering a different instance
+        --   starts a new one, so a dungeon run shows up as its own line.
+        --   Manual / by-name: skip the same source within 30 minutes in the
+        --   same zone, and the same instance (wipes, corpse runs, reloads).
         --   Entries from before locations were recorded only carried a zone when
         --   instanced, so on an old entry (no `instance` field) a zone still
         --   means "instance" -- which is why new entries always set the field.
+        --   A different group (outing) is always a new entry, so "who else was
+        --   there" stays true for every line.
+        local outing = grouped and Outings.currentId or nil
         if #enc > 0 then
             local last = enc[#enc]
             local lastInstanced = last.instance or (last.instance == nil and last.zone ~= nil)
-            if last.source == effectiveSource then
+            local lastSeen = last.till or last._ts
+            local sameOuting = not (last.outing and outing) or last.outing == outing
+            if grouped and IsGroupEncounter(last) and sameOuting
+               and (continuing or (lastSeen and (now - lastSeen) < 1800)) then
+                if not instanced or (lastInstanced and last.zone == where) then
+                    last.till = now
+                    -- keep the level they had when you met; fill it in if unknown
+                    if last.lvl == nil then last.lvl = SafeLevel(theirLevel) end
+                    if outing and not last.outing then last.outing = outing end
+                    if role then last.role = role end
+                    return
+                end
+            elseif not grouped and last.source == effectiveSource then
                 if instanced then
                     if lastInstanced and last.zone == where then return end
                 elseif not lastInstanced and last._ts and (now - last._ts) < 1800
@@ -346,6 +1016,8 @@ do
             remote   = remote and true or nil,
             lvl      = SafeLevel(theirLevel),
             myLvl    = SafeLevel(UnitLevel and UnitLevel("player")),
+            outing   = outing,
+            role     = role,
         }
     end
 end
@@ -354,9 +1026,14 @@ end
 -- them (not an add-by-name): "Met in Elwynn Forest at level 12 (you 11)".
 -- Plain text without colour codes, or nil when no encounter has a location.
 local function MetLineFor(p)
-    for _, e in ipairs(p and p.encounters or {}) do
+    -- Across all of this player's characters, so it's the first time you met
+    -- the person, whichever character they were on.
+    local enc, owners = People.Encounters(p)
+    for _, e in ipairs(enc) do
         if e.zone and not e.remote then
             local text = "Met in " .. e.zone
+            local owner = owners and owners[e]
+            if owner and owner ~= p then text = text .. " as " .. owner.name end
             if e.lvl then text = text .. " at level " .. e.lvl end
             if e.myLvl then
                 text = text .. (e.lvl and (" (you " .. e.myLvl .. ")") or (" (you were " .. e.myLvl .. ")"))
@@ -379,6 +1056,15 @@ local sortedKeys = {}
 local sortField     = "seen"
 local sortDirection  = "desc"
 local groupFilterActive = false
+-- The newer filters share one table (file-scope locals are capped at 200):
+--   tag    tag name, or nil for all
+--   days   only players seen in the last N days, or nil
+--   outing an outing id: only who was in that group, Inbox players included
+local listFilters = { tag = nil, days = nil, outing = nil }
+
+-- Forward declaration: defined with the list further down, but the filter
+-- widgets above it already need to call it.
+local RefreshList
 
 -- Returns a set of name-realm keys for all current group/raid members
 local function GetCurrentGroupKeys()
@@ -408,18 +1094,42 @@ local function RebuildSorted(filterText, ratingMin, ratingMax, sourceFilter, cla
     filterText = (filterText or ""):lower()
     local classLower = classFilter and classFilter:lower() or nil
     local groupKeys = groupFilterActive and GetCurrentGroupKeys() or nil
+    -- Searching for a main also finds their alts.
+    local personHits = (filterText ~= "") and People.NameHits(filterText) or nil
+    -- One past group: its members, including any still in the Inbox, since
+    -- reviewing who you just played with is the point.
+    local outingKeys
+    local outing = Outings.Get(listFilters.outing)
+    if outing then
+        outingKeys = {}
+        for _, k in ipairs(outing.members) do outingKeys[k] = true end
+    end
+    -- "seen" is a sortable "YYYY-MM-DD HH:MM" string, so compare strings.
+    local seenCutoff = listFilters.days and date("%Y-%m-%d %H:%M", time() - listFilters.days * 86400) or nil
     for key, p in pairs(db.players) do
         local match = true
-        -- Skip pending (inbox) players
-        if p.pending then match = false end
+        -- Skip pending (inbox) players, unless showing one group
+        if p.pending and not outingKeys then match = false end
+        if match and outingKeys and not outingKeys[key] then match = false end
         -- Group filter: only show current group/raid members
         if match and groupKeys and not groupKeys[key] then match = false end
-        -- Text search: name only
-        if match and filterText ~= "" and not p.name:lower():find(filterText, 1, true) then
-            match = false
+        if match and seenCutoff and (p.seen or "") < seenCutoff then match = false end
+        if match and listFilters.tag then
+            local _, tagSet = Tags.Of(p)
+            if not tagSet[listFilters.tag] then match = false end
+        end
+        -- Text search: name, nickname, alts' names, or a tag
+        if match and filterText ~= "" and not p.name:lower():find(filterText, 1, true)
+           and not (p.personId and personHits[p.personId]) then
+            local nick = Tags.Nick(p)
+            local tagText = Tags.Text(p)
+            if not (nick and nick:lower():find(filterText, 1, true))
+               and not (tagText and tagText:lower():find(filterText, 1, true)) then
+                match = false
+            end
         end
         -- Rating range filter
-        local r = p.rating or 0
+        local r = People.Rating(p)
         if ratingMin and r < ratingMin then match = false end
         if ratingMax and r > ratingMax then match = false end
         -- Source filter (checks all encounter sources, not just most recent)
@@ -443,7 +1153,7 @@ local function RebuildSorted(filterText, ratingMin, ratingMax, sourceFilter, cla
         if sortField == "name" then
             va, vb = (pa.name or ""):lower(), (pb.name or ""):lower()
         elseif sortField == "rating" then
-            va, vb = pa.rating or 0, pb.rating or 0
+            va, vb = People.Rating(pa), People.Rating(pb)
         elseif sortField == "class" then
             va, vb = (pa.class or ""):lower(), (pb.class or ""):lower()
         elseif sortField == "level" then
@@ -662,7 +1372,7 @@ D("pill factory OK")
 ----------------------------------------------------------------------
 local mainTabButtons = {}
 local nativeMainTabs   -- native bottom tabs (Mainline only); built after the pills
-local NATIVE_TAB_INDEX = { Database = 1, Inbox = 2, Settings = 3 }
+local NATIVE_TAB_INDEX = { Database = 1, Inbox = 2, Groups = 3, Settings = 4 }
 local settingsPanel = { spec = {} }
 local dbElements = {}  -- database-specific UI elements to show/hide
 local inboxContent     -- forward declare
@@ -717,6 +1427,10 @@ local function ShowMainTab(name)
             inboxContent:Hide()
         end
     end
+    if Outings.tabFrame then
+        Outings.tabFrame:SetShown(name == "Groups")
+        if name == "Groups" and Outings.RefreshTab then Outings.RefreshTab() end
+    end
     if settingsPanel.frame then settingsPanel.frame:SetShown(name == "Settings") end
     for _, btn in ipairs(settingsPanel.mainButtons or {}) do
         btn:SetShown(name ~= "Settings")
@@ -724,7 +1438,7 @@ local function ShowMainTab(name)
 end
 
 do
-    local MAIN_TAB_NAMES = { "Database", "Inbox", "Settings" }
+    local MAIN_TAB_NAMES = { "Database", "Inbox", "Groups", "Settings" }
     local prev
     for _, tname in ipairs(MAIN_TAB_NAMES) do
         local btn = MakePill(f, tname)
@@ -915,6 +1629,111 @@ groupFilterPill:HookScript("OnEnter", function(self)
 end)
 groupFilterPill:HookScript("OnLeave", function() GameTooltip:Hide() end)
 
+----------------------------------------------------------------------
+-- Tag, recency and last-group filters (widgets live in listFilters too)
+----------------------------------------------------------------------
+do
+    -- A cycling button like the rating / class filters. Left-click forward,
+    -- right-click back; `options()` is re-read on each click.
+    local function CycleButton(width, options, apply, tipTitle, tipText)
+        local btn = CreateFrame("Button", nil, f)
+        btn:SetSize(width, 22)
+        btn:SetNormalFontObject(GameFontNormalSmall)
+        btn:SetHighlightFontObject(GameFontHighlightSmall)
+        btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        local bg = btn:CreateTexture(nil, "BACKGROUND")
+        bg:SetAllPoints()
+        if bg.SetColorTexture then bg:SetColorTexture(0.10, 0.10, 0.12, 0.85) else bg:SetTexture(0.10, 0.10, 0.12, 0.85) end
+        btn.idx = 1
+        function btn:Show1()
+            local opts = options()
+            if btn.idx > #opts then btn.idx = 1 end
+            btn:SetText(opts[btn.idx].label)
+            apply(opts[btn.idx].value)
+        end
+        btn:SetScript("OnClick", function(self, mouse)
+            local opts = options()
+            self.idx = self.idx + ((mouse == "RightButton") and -1 or 1)
+            if self.idx < 1 then self.idx = #opts end
+            if self.idx > #opts then self.idx = 1 end
+            self:Show1()
+            if RefreshList then RefreshList() end
+        end)
+        btn:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+            GameTooltip:AddLine(tipTitle, 0.67, 0.87, 1)
+            GameTooltip:AddLine(tipText, 0.7, 0.7, 0.7, true)
+            GameTooltip:AddLine("Left-click to cycle forward, right-click back", 0.7, 0.7, 0.7)
+            GameTooltip:Show()
+        end)
+        btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        return btn
+    end
+
+    -- Tags that someone actually has, so the cycle doesn't stop on empty ones.
+    local function TagOptions()
+        local opts = { { label = T.manual .. "All Tags|r", value = nil } }
+        local used = {}
+        for _, p in pairs(db and db.players or {}) do
+            for t in pairs(p.tags or {}) do used[t] = true end
+        end
+        for _, t in ipairs(Tags.All()) do
+            if used[t] then opts[#opts + 1] = { label = T.manual .. t .. "|r", value = t } end
+        end
+        return opts
+    end
+    listFilters.tagBtn = CycleButton(86, TagOptions, function(v) listFilters.tag = v end,
+        "Tag Filter", "Show only players with one of your tags.")
+    listFilters.tagBtn:SetPoint("LEFT", classFilterBtn, "RIGHT", 4, 0)
+    listFilters.tagBtn:Show1()
+
+    local DAY_OPTIONS = {
+        { label = T.light .. "Any Time|r",     value = nil },
+        { label = T.light .. "Last 7 Days|r",  value = 7 },
+        { label = T.light .. "Last 30 Days|r", value = 30 },
+    }
+    listFilters.daysBtn = CycleButton(84, function() return DAY_OPTIONS end, function(v) listFilters.days = v end,
+        "Last Seen", "Show only players you've seen recently.")
+    listFilters.daysBtn:SetPoint("LEFT", sourcePills[#sourcePills], "RIGHT", 10, 0)
+    listFilters.daysBtn:Show1()
+
+    -- Everyone from your latest group (or one picked in the Groups tab).
+    local pill = MakePill(f, "Last Group")
+    pill:FitLabel(70)
+    pill:SetPoint("RIGHT", groupFilterPill, "LEFT", -6, 0)
+    pill:HookScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:AddLine("Last Group", 0.67, 0.87, 1)
+        GameTooltip:AddLine("Show everyone from your most recent group, Inbox players included. Pick an older group in the Groups tab.", 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    pill:HookScript("OnLeave", function() GameTooltip:Hide() end)
+    listFilters.groupPill = pill
+
+    -- Show one group's members (nil turns the filter off).
+    function listFilters.ShowOuting(id)
+        listFilters.outing = id
+        local o = Outings.Get(id)
+        if o and id ~= Outings.Latest() then
+            pill.text:SetText("Group " .. ((o.time or ""):gsub("^%d+%-", ""):gsub(" .*$", "")))
+        else
+            pill.text:SetText("Last Group")
+        end
+        pill:FitLabel(70)
+        pill:SetActive(o ~= nil)
+        if RefreshList then RefreshList() end
+    end
+    pill:SetScript("OnClick", function()
+        if listFilters.outing then
+            listFilters.ShowOuting(nil)
+        else
+            local latest = Outings.Latest()
+            if not latest then P("No groups recorded yet - they're saved as you group with people.") return end
+            listFilters.ShowOuting(latest)
+        end
+    end)
+end
+
 D("group filter pill OK")
 
 ----------------------------------------------------------------------
@@ -944,8 +1763,8 @@ else
     headerBg:SetTexture(0.15, 0.15, 0.18, 0.9)
 end
 
--- Forward declare RefreshList (will be defined later, but we need it in header click)
-local RefreshList
+-- RefreshList is forward-declared next to the sort state (the header clicks
+-- and filter widgets call it before it's defined).
 
 ----------------------------------------------------------------------
 -- Column layout
@@ -1205,14 +2024,25 @@ local function PopulateRow(row, key, dataIdx)
     end
 
     local cc = ClassColor(p.class)
-    row.nameText:SetText(cc .. p.name .. "|r")
+    local personTag = People.Tag(p)
+    local nick = Tags.Nick(p)
+    row.nameText:SetText(cc .. p.name .. "|r"
+        .. (nick and ("  " .. T.soft .. "\"" .. nick .. "\"|r") or "")
+        .. (personTag and ("  " .. T.dim .. "(" .. personTag .. ")|r") or "")
+        .. (p.pending and ("  " .. T.warn .. "(Inbox)|r") or ""))
     row.levelText:SetText(T.soft .. (p.level or "?") .. "|r")
     local raceStr = (p.race and p.race ~= "") and (T.grey .. p.race .. "|r ") or ""
     row.classText:SetText(raceStr .. cc .. (p.class or "") .. "|r")
-    row.ratingText:SetText(C.RatingIcon(p.rating or 0) .. ColorRating(p.rating or 0))
+    row.ratingText:SetText(C.RatingIcon(People.Rating(p)) .. ColorRating(People.Rating(p)))
 
-    if p.note and p.note ~= "" then
-        row.noteText:SetText(T.text .. p.note .. "|r")
+    -- Line 2: tags first (short and scannable), then the note.
+    local bestNote, noteOwner = People.BestNote(p)
+    local tagText = Tags.Text(p)
+    local tagStr = tagText and (T.manual .. "[" .. tagText:gsub(", ", "] [") .. "]|r  ") or ""
+    if bestNote then
+        row.noteText:SetText(tagStr .. (noteOwner and (T.dim .. noteOwner .. ": |r") or "") .. T.text .. bestNote .. "|r")
+    elseif tagStr ~= "" then
+        row.noteText:SetText(tagStr)
     else
         row.noteText:SetText(T.faint .. "(no note)|r")
     end
@@ -1226,7 +2056,7 @@ local function PopulateRow(row, key, dataIdx)
     row.playerKey = key
 
     -- Subtle row tint based on rating
-    local r = p.rating or 0
+    local r = People.Rating(p)
     local baseEven = ((dataIdx or 1) % 2 == 0)
     local br, bg, bb, ba
     if r <= -3 then
@@ -1356,8 +2186,9 @@ function RowMenu(self)
         whisperTarget = p.name .. "-" .. p.realm
     end
 
-    local shown = C.ShowContextMenu(self, {
-        { text = ClassColor(p.class) .. p.name .. "|r", isTitle = true },
+    local menuTag = People.Tag(p)
+    local entries = {
+        { text = ClassColor(p.class) .. p.name .. "|r" .. (menuTag and ("  " .. T.dim .. "(" .. menuTag .. ")|r") or ""), isTitle = true },
         { text = "Whisper", func = function()
             ChatFrame_OpenChat("/w " .. whisperTarget .. " ")
         end },
@@ -1372,12 +2203,37 @@ function RowMenu(self)
             popupActiveKey = key
             StaticPopup_Show("WTFAY_EDIT_NOTE", p.name)
         end },
+        { text = "Tags & Nickname...", func = function()
+            if Tags.ShowPicker then Tags.ShowPicker(key) end
+        end },
         { text = T.off .. "Remove|r", func = function()
             popupActiveKey = key
             StaticPopup_Show("WTFAY_CONFIRM_REMOVE", p.name)
         end },
         { text = "Cancel" },
-    })
+    }
+
+    -- Just above Remove (position 7 of the list above).
+    local at = 7
+    table.insert(entries, at, { text = "Link to Another Character...", func = function()
+        People.ShowPicker(key)
+    end })
+    if People.Of(p) then
+        at = at + 1
+        if not People.IsMain(p) then
+            table.insert(entries, at, { text = "Make Main Character", func = function()
+                People.SetMain(key)
+                P(ClassColor(p.class) .. p.name .. "|r is now the main character.")
+                People.Changed()
+            end })
+            at = at + 1
+        end
+        table.insert(entries, at, { text = "Unlink", func = function()
+            People.UnlinkAndReport(key)
+        end })
+    end
+
+    local shown = C.ShowContextMenu(self, entries)
 
     if not shown then
         D("RowMenu: no menu system available, falling back to rating picker")
@@ -1529,6 +2385,8 @@ f:SetScript("OnShow", function()
             RefreshList()
         elseif activeMainTab == "Inbox" and RefreshInbox then
             RefreshInbox()
+        elseif activeMainTab == "Groups" and Outings.RefreshTab then
+            Outings.RefreshTab()
         end
     end)
 end)
@@ -1541,7 +2399,8 @@ D("refresh list code OK")
 -- scroll frame used to be re-shown under the ScrollBox (a second scrollbar),
 -- the ScrollBox itself was missing (so it stayed up behind the Inbox), and the
 -- redundant "Search:" label kept reappearing beside the native search box.
-dbElements = { searchBox, ratingFilterBtn, classFilterBtn, groupFilterPill, countLabel, headerBar, scrollParent, listInset }
+dbElements = { searchBox, ratingFilterBtn, classFilterBtn, groupFilterPill, countLabel, headerBar, scrollParent, listInset,
+    listFilters.tagBtn, listFilters.daysBtn, listFilters.groupPill }
 if not C.HasSearchBox then dbElements[#dbElements + 1] = searchLabel end
 if USE_SCROLLBOX and scrollBox then
     dbElements[#dbElements + 1] = scrollBox
@@ -1588,6 +2447,7 @@ do
             local count = 0
             for key, p in pairs(db.players) do
                 if p.pending then
+                    People.Unlink(key)
                     db.players[key] = nil
                     count = count + 1
                 end
@@ -1814,6 +2674,237 @@ end
 
 D("inbox tab OK")
 
+----------------------------------------------------------------------
+-- Groups tab: every group you've been in, newest first
+--
+-- Left-click a group to rate who was in it (the recap card), right-click
+-- for its note, the list of its players, or Forget.
+----------------------------------------------------------------------
+do
+    local gc = CreateFrame("Frame", nil, f)
+    gc:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -56)
+    gc:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 42)
+    gc:Hide()
+    Outings.tabFrame = gc
+
+    local title = gc:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", gc, "TOPLEFT", 4, -4)
+    title:SetText(T.muted .. "Groups you've been in - click one to rate who was there:|r")
+
+    local countText = gc:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    countText:SetPoint("TOPRIGHT", gc, "TOPRIGHT", -4, -6)
+
+    local ROW_H = 36
+    local listParent = CreateFrame("Frame", nil, gc)
+    listParent:SetPoint("TOPLEFT", gc, "TOPLEFT", 0, -24)
+    listParent:SetPoint("BOTTOMRIGHT", gc, "BOTTOMRIGHT", -18, 0)
+
+    local scroll = CreateFrame("ScrollFrame", "WTFAYGroupsScrollFrame", gc, "FauxScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", listParent, "TOPLEFT", 0, 0)
+    scroll:SetPoint("BOTTOMRIGHT", listParent, "BOTTOMRIGHT", 0, 0)
+
+    local holder = CreateFrame("Frame", nil, gc)
+    holder:SetPoint("TOPLEFT", listParent, "TOPLEFT", 0, 0)
+    holder:SetPoint("BOTTOMRIGHT", listParent, "BOTTOMRIGHT", 0, 0)
+
+    local inset = C.CreateInset(gc)
+    inset:SetPoint("TOPLEFT", listParent, "TOPLEFT", -4, 4)
+    inset:SetPoint("BOTTOMRIGHT", listParent, "BOTTOMRIGHT", 4, -4)
+    inset:EnableMouse(false)
+    if inset.SetFrameLevel then inset:SetFrameLevel(gc:GetFrameLevel()) end
+
+    local empty = holder:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    empty:SetPoint("TOPLEFT", holder, "TOPLEFT", 10, -12)
+    empty:SetPoint("RIGHT", holder, "RIGHT", -10, 0)
+    empty:SetJustifyH("LEFT")
+    empty:SetText(T.dim .. "No groups yet. WTFAY saves one each time you group with people "
+        .. "(Auto-Track in Settings must be on). Battlegrounds and arenas aren't recorded.|r")
+
+    local groupRows, ids = {}, {}
+
+    StaticPopupDialogs["WTFAY_EDIT_GROUP_NOTE"] = {
+        text = "Note for this group:",
+        button1 = "Save",
+        button2 = "Cancel",
+        hasEditBox = true,
+        editBoxWidth = 280,
+        OnShow = function(self)
+            local eb = self.editBox or _G[self:GetName() .. "EditBox"]
+            local o = Outings.Get(Outings.editingId)
+            if eb then
+                eb:SetText(o and o.note or "")
+                eb:SetFocus()
+                eb:HighlightText()
+            end
+        end,
+        OnAccept = function(self)
+            local eb = self.editBox or _G[self:GetName() .. "EditBox"]
+            local o = Outings.Get(Outings.editingId)
+            if not (o and eb) then return end
+            local text = (eb:GetText() or ""):trim()
+            o.note = (text ~= "") and text or nil
+            if Outings.RefreshTab then Outings.RefreshTab() end
+            if Outings.RefreshRecap then Outings.RefreshRecap() end
+        end,
+        EditBoxOnEnterPressed = function(self)
+            local parent = self:GetParent()
+            local accept = StaticPopupDialogs["WTFAY_EDIT_GROUP_NOTE"].OnAccept
+            accept(parent)
+            parent:Hide()
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
+
+    StaticPopupDialogs["WTFAY_FORGET_GROUP"] = {
+        text = "Forget this group?\nIts players, ratings and notes stay; only the group record goes.",
+        button1 = "Forget",
+        button2 = "Cancel",
+        OnAccept = function()
+            local id = Outings.editingId
+            if not Outings.Get(id) then return end
+            Outings.Forget(id)
+            if listFilters.outing == id then listFilters.ShowOuting(nil) end
+            P("Group forgotten.")
+            if Outings.RefreshTab then Outings.RefreshTab() end
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
+
+    local function GroupMenu(row)
+        local id = row.outingId
+        local o = Outings.Get(id)
+        if not o then return end
+        C.ShowContextMenu(row, {
+            { text = "Group of " .. (o.time or "?"), isTitle = true },
+            { text = "Rate the Players...", func = function() Outings.ShowRecap(id) end },
+            { text = "Show Players in Database", func = function()
+                listFilters.ShowOuting(id)
+                ShowMainTab("Database")
+            end },
+            { text = "Edit Group Note", func = function()
+                Outings.editingId = id
+                StaticPopup_Show("WTFAY_EDIT_GROUP_NOTE")
+            end },
+            { text = T.off .. "Forget This Group|r", func = function()
+                Outings.editingId = id
+                StaticPopup_Show("WTFAY_FORGET_GROUP")
+            end },
+            { text = "Cancel" },
+        })
+    end
+
+    local function CreateGroupRow(i)
+        local row = CreateFrame("Button", nil, holder)
+        row:SetHeight(ROW_H)
+        row:SetPoint("TOPLEFT", holder, "TOPLEFT", 0, -((i - 1) * ROW_H))
+        row:SetPoint("RIGHT", holder, "RIGHT", 0, 0)
+        row:EnableMouse(true)
+        row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        if BackdropTemplateMixin then Mixin(row, BackdropTemplateMixin); row:OnBackdropLoaded() end
+        if row.SetBackdrop then
+            row:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8x8", insets = { left = 0, right = 0, top = 0, bottom = 1 } })
+        end
+        row.baseR, row.baseG, row.baseB, row.baseA = 0.08, 0.08, 0.10, 0.8
+        row:SetScript("OnEnter", function(self)
+            if self.SetBackdropColor then self:SetBackdropColor(self.baseR + 0.12, self.baseG + 0.15, self.baseB + 0.20, 0.9) end
+            local o = Outings.Get(self.outingId)
+            if not o then return end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText(SOURCE_INFO[o.kind] and SOURCE_INFO[o.kind].label or "Group", 1, 0.82, 0)
+            GameTooltip:AddLine((o.time or "?") .. "  -  " .. Outings.Duration(o), 0.8, 0.8, 0.8)
+            if #(o.zones or {}) > 0 then GameTooltip:AddLine(table.concat(o.zones, ", "), 0.87, 0.67, 0.27, true) end
+            local members = Outings.Members(o)
+            for _, m in ipairs(members) do
+                GameTooltip:AddLine(ClassColor(m.class) .. m.name .. "|r  " .. ColorRating(People.Rating(m))
+                    .. (m.pending and (" " .. T.warn .. "(Inbox)|r") or ""))
+            end
+            if o.note then GameTooltip:AddLine(o.note, 1, 1, 1, true) end
+            GameTooltip:AddLine("Left-click to rate the players, right-click for more", 0.6, 0.6, 0.6)
+            GameTooltip:Show()
+        end)
+        row:SetScript("OnLeave", function(self)
+            if self.SetBackdropColor then self:SetBackdropColor(self.baseR, self.baseG, self.baseB, self.baseA) end
+            GameTooltip:Hide()
+        end)
+        row:SetScript("OnClick", function(self, mouse)
+            if not self.outingId then return end
+            if mouse == "RightButton" then GroupMenu(self) else Outings.ShowRecap(self.outingId) end
+        end)
+
+        row.line1 = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        row.line1:SetPoint("TOPLEFT", row, "TOPLEFT", 6, -4)
+        row.line1:SetPoint("RIGHT", row, "RIGHT", -6, 0)
+        row.line1:SetJustifyH("LEFT")
+        row.line1:SetWordWrap(false)
+        row.line2 = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        row.line2:SetPoint("TOPLEFT", row.line1, "BOTTOMLEFT", 0, -2)
+        row.line2:SetPoint("RIGHT", row, "RIGHT", -6, 0)
+        row.line2:SetJustifyH("LEFT")
+        row.line2:SetWordWrap(false)
+        groupRows[i] = row
+        return row
+    end
+
+    function Outings.RefreshTab()
+        if not db then return end
+        ids = Outings.Sorted()
+        local total = #ids
+        countText:SetText(T.muted .. total .. " group" .. (total == 1 and "" or "s") .. "|r")
+        empty:SetShown(total == 0)
+
+        local h = listParent:GetHeight()
+        if not h or h < 1 then h = 200 end
+        local visible = math.max(1, math.floor(h / ROW_H))
+        FauxScrollFrame_Update(scroll, total, visible, ROW_H)
+        local offset = FauxScrollFrame_GetOffset(scroll)
+
+        for i = 1, visible do
+            local row = groupRows[i] or CreateGroupRow(i)
+            local id = ids[offset + i]
+            local o = Outings.Get(id)
+            if o then
+                local info = SOURCE_INFO[o.kind] or SOURCE_INFO.group
+                local when = (o.time or "?"):gsub("^%d+%-", "")
+                local where = Outings.Where(o, 3)
+                row.line1:SetText(T.light .. when .. "|r  |cFF" .. info.color .. info.label .. "|r  "
+                    .. T.dim .. Outings.Duration(o) .. "|r" .. (where ~= "" and ("  " .. T.brass .. where .. "|r") or ""))
+                local members = Outings.Members(o)
+                local with = Outings.WithText(o, nil, 5)
+                row.line2:SetText(T.muted .. #members .. " player" .. (#members == 1 and "" or "s") .. "|r"
+                    .. (with ~= "" and ("  " .. with) or "")
+                    .. (o.note and ("  " .. T.dim .. "- " .. o.note .. "|r") or ""))
+                row.outingId = id
+                local even = ((offset + i) % 2 == 0)
+                row.baseR, row.baseG, row.baseB = even and 0.12 or 0.08, even and 0.12 or 0.08, even and 0.15 or 0.10
+                if row.SetBackdropColor then row:SetBackdropColor(row.baseR, row.baseG, row.baseB, row.baseA) end
+                row:Show()
+            else
+                row.outingId = nil
+                row:Hide()
+            end
+        end
+        for i = visible + 1, #groupRows do groupRows[i]:Hide() end
+    end
+
+    scroll:EnableMouseWheel(true)
+    scroll:SetScript("OnMouseWheel", function(self, delta)
+        local name = self:GetName()
+        local bar = name and _G[name .. "ScrollBar"]
+        if bar and bar.SetValue and bar.GetValue then
+            bar:SetValue(bar:GetValue() - delta * ROW_H * (IsShiftKeyDown() and 5 or 1))
+        end
+    end)
+    scroll:SetScript("OnVerticalScroll", function(self, offset)
+        FauxScrollFrame_OnVerticalScroll(self, offset, ROW_H, Outings.RefreshTab)
+    end)
+end
+
+D("groups tab OK")
+
 -- Forward declaration for minimap button (created after settings, referenced by settings toggles)
 local minimapBtn
 
@@ -1844,7 +2935,7 @@ do
     local tabButtons = {}
     local tabContents = {}
     local tabScrolls = {}
-    local tabHeights = { General = 220, Alerts = 360, Display = 280 }
+    local tabHeights = { General = 280, Alerts = 360, Display = 330 }
     local activeTab = "General"
 
     local tabWidth = 80
@@ -2100,6 +3191,16 @@ do
         end, SETTINGS_DEFAULTS.unitMenu
     )
 
+    local groupRecapToggle = CreateToggle(gc, -220,
+        "Rate Your Group Afterwards",
+        "When you leave a group, show a card with everyone who was in it, to rate them while you still remember. Waits until you're out of combat.",
+        function() return db and db.settings and db.settings.groupRecap and true or false end,
+        function(val)
+            if db and db.settings then db.settings.groupRecap = val end
+            P("Group rating card: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.groupRecap
+    )
+
     ----------------------------------------------------------------
     -- Tab: Alerts
     ----------------------------------------------------------------
@@ -2225,8 +3326,18 @@ do
         end, SETTINGS_DEFAULTS.tooltipHint
     )
 
+    local tooltipNotesToggle = CreateToggle(dc, -210,
+        "  Show Private Notes",
+        "Include your notes, tags and nicknames on the tooltip. Turn off when streaming or sharing your screen; the rating still shows.",
+        function() return db and db.settings and db.settings.tooltipNotes or false end,
+        function(val)
+            if db and db.settings then db.settings.tooltipNotes = val end
+            P("Private notes on tooltips: " .. (val and T.on .. "ON|r" or T.off .. "OFF|r"))
+        end, SETTINGS_DEFAULTS.tooltipNotes
+    )
+
     -- Window style (shared builder; Mainline only)
-    local skinRefresh = settingsPanel.BuildSkinPicker(dc, -216)
+    local skinRefresh = settingsPanel.BuildSkinPicker(dc, -266)
     if skinRefresh then RecordCustom("Display", 40, settingsPanel.BuildSkinPicker) end
 
     ----------------------------------------------------------------
@@ -2258,9 +3369,11 @@ do
         minimapToggle.Refresh()
         whoEnrichToggle.Refresh()
         unitMenuToggle.Refresh()
+        groupRecapToggle.Refresh()
         tooltipToggle.Refresh()
         tooltipGuildToggle.Refresh()
         tooltipHintToggle.Refresh()
+        tooltipNotesToggle.Refresh()
         if skinRefresh then skinRefresh() end
         if soundRefresh then soundRefresh() end
         ShowTab(activeTab)
@@ -2295,7 +3408,7 @@ local MAIN_TOP_SHIFT = 22
 local mainLayoutBase   -- widget -> its original points
 
 local function ApplyMainLayout()
-    local widgets = { searchBox, sourcePills[1], groupFilterPill, countLabel, headerBar, inboxContent, settingsPanel.frame }
+    local widgets = { searchBox, sourcePills[1], groupFilterPill, countLabel, headerBar, inboxContent, Outings.tabFrame, settingsPanel.frame }
     if not mainLayoutBase then
         mainLayoutBase = {}
         for _, w in ipairs(widgets) do
@@ -2624,11 +3737,11 @@ do
 
     local function EscField(s)
         s = (s or ""):gsub("|", FIELD_ESC_PIPE)
-        return s:gsub("\t", FIELD_ESC_TAB)
+        return (s:gsub("\t", FIELD_ESC_TAB))
     end
     local function UnescField(s)
         s = (s or ""):gsub(FIELD_ESC_TAB, "\t")
-        return s:gsub(FIELD_ESC_PIPE, "|")
+        return (s:gsub(FIELD_ESC_PIPE, "|"))
     end
 
     local function ExportDB()
@@ -2644,21 +3757,43 @@ do
                     EscField(p.class),
                     EscField(p.race or ""),
                     tostring(p.level or 0),
-                    tostring(p.rating or 0),
+                    tostring(People.Rating(p)),
                     EscField(p.note or ""),
                     EscField(p.source or "manual"),
                     EscField(p.seen or ""),
                 }
+                -- Linked characters add two fields; the importer has always
+                -- accepted lines longer than 10 fields, so older versions
+                -- simply ignore them.
+                local person = People.Of(p)
+                local ownTags = {}
+                for t in pairs(p.tags or {}) do ownTags[#ownTags + 1] = t end
+                table.sort(ownTags)
+                local extra = (p.nick and p.nick ~= "") or #ownTags > 0
+                if person then
+                    parts[#parts + 1] = p.personId
+                    parts[#parts + 1] = (person.main == key) and "1" or "0"
+                elseif extra then
+                    parts[#parts + 1] = ""   -- no link
+                    parts[#parts + 1] = ""
+                end
+                -- Nickname and tags (comma-separated) as fields 13 and 14.
+                if extra then
+                    parts[#parts + 1] = EscField(p.nick or "")
+                    parts[#parts + 1] = EscField(table.concat(ownTags, ","))
+                end
                 lines[#lines + 1] = table.concat(parts, SEP)
             end
         end
         return table.concat(lines, "\n")
     end
 
-    local function ImportDB(text)
-        if not text or text == "" then return 0, 0 end
+    -- Read an export into records without touching the database. Returns the
+    -- records and how many non-empty lines weren't understood.
+    local function ParseExport(text)
+        local records, skipped = {}, 0
+        if not text or text == "" then return records, skipped end
         local lines = { strsplit("\n", text) }
-        local added, updated = 0, 0
 
         -- Check header and detect format version
         local startLine = 1
@@ -2672,75 +3807,153 @@ do
         end
 
         for i = startLine, #lines do
-            local line = (lines[i] or ""):trim()
+            -- Not trim(): a tab is a field separator, and a line can end in an
+            -- empty field.
+            local line = (lines[i] or ""):gsub("^[ \r\n]+", ""):gsub("[ \r\n]+$", "")
             if line ~= "" then
                 local parts = { strsplit(lineSep, line) }
                 -- Need at least: key, name, realm, class, race, level, rating, note, source, seen
+                local r
                 if #parts >= 10 then
-                    local key     = UnescField(parts[1])
-                    local name    = UnescField(parts[2])
-                    local realm   = UnescField(parts[3])
-                    local class   = UnescField(parts[4])
-                    local race    = UnescField(parts[5])
-                    local level   = tonumber(parts[6]) or 0
-                    local rating  = tonumber(parts[7]) or 0
-                    local note    = UnescField(parts[8])
-                    local source  = UnescField(parts[9])
-                    local seen    = UnescField(parts[10])
-
-                    if key ~= "" and name ~= "" then
-                        -- Recompute rather than trusting the file's key, so an
-                        -- export from an older build (or from a realm whose
-                        -- name contains a dash or space) lands on the same
-                        -- normalized key the rest of the addon uses.
-                        if realm ~= "" then
-                            realm = NormalizeRealm(realm)
-                            key   = MakeKey(name, realm)
-                        end
-                        if db.players[key] then
-                            -- Merge: keep higher absolute rating, append note if different
-                            local existing = db.players[key]
-                            if math.abs(rating) > math.abs(existing.rating or 0) then
-                                existing.rating = rating
-                            end
-                            if note ~= "" and note ~= existing.note then
-                                if (existing.note or "") == "" then
-                                    existing.note = note
-                                else
-                                    existing.note = existing.note .. " | " .. note
-                                end
-                            end
-                            -- Update level if imported is higher
-                            if level > (existing.level or 0) then
-                                existing.level = level
-                            end
-                            -- Update class/race if we had Unknown
-                            if (existing.class or "Unknown") == "Unknown" and class ~= "Unknown" then
-                                existing.class = class
-                            end
-                            if (existing.race or "") == "" and race ~= "" then
-                                existing.race = race
-                            end
-                            updated = updated + 1
-                        else
-                            db.players[key] = {
-                                name       = name,
-                                realm      = realm,
-                                class      = class,
-                                race       = race,
-                                level      = level,
-                                rating     = rating,
-                                note       = note,
-                                source     = source,
-                                seen       = seen,
-                                encounters = {},
-                            }
-                            added = added + 1
-                        end
+                    r = {
+                        key    = UnescField(parts[1]),
+                        name   = UnescField(parts[2]),
+                        realm  = UnescField(parts[3]),
+                        class  = UnescField(parts[4]),
+                        race   = UnescField(parts[5]),
+                        level  = tonumber(parts[6]) or 0,
+                        rating = math.max(-3, math.min(5, tonumber(parts[7]) or 0)),
+                        note   = UnescField(parts[8]),
+                        source = UnescField(parts[9]),
+                        seen   = UnescField(parts[10]),
+                    }
+                    if r.key == "" or r.name == "" then r = nil end
+                end
+                if r then
+                    -- Recompute rather than trusting the file's key, so an
+                    -- export from an older build (or from a realm whose
+                    -- name contains a dash or space) lands on the same
+                    -- normalized key the rest of the addon uses.
+                    if r.realm ~= "" then
+                        r.realm = NormalizeRealm(r.realm)
+                        r.key   = MakeKey(r.name, r.realm)
                     end
+                    -- Exports up to v0.8.1 end every line in a stray "0"
+                    -- at field 11, so only a line with field 12 has a link.
+                    if parts[12] and parts[11] ~= "" then
+                        r.linkId, r.isMain = parts[11], (parts[12] == "1")
+                    end
+                    if parts[13] and parts[13] ~= "" then r.nick = UnescField(parts[13]) end
+                    if parts[14] and parts[14] ~= "" then
+                        r.tags = {}
+                        for t in UnescField(parts[14]):gmatch("[^,]+") do r.tags[#r.tags + 1] = t end
+                    end
+                    records[#records + 1] = r
+                else
+                    skipped = skipped + 1
                 end
             end
         end
+        return records, skipped
+    end
+
+    -- What a Merge would do, counted without changing anything.
+    local function PreviewImport(text)
+        local records, skipped = ParseExport(text)
+        local s = { total = #records, new = 0, known = 0, rating = 0, notes = 0, links = 0, skipped = skipped }
+        local groups = {}
+        for _, r in ipairs(records) do
+            local existing = db.players[r.key]
+            if existing then
+                s.known = s.known + 1
+                if r.rating ~= People.Rating(existing) then s.rating = s.rating + 1 end
+                if r.note ~= "" and r.note ~= (existing.note or "") then s.notes = s.notes + 1 end
+            else
+                s.new = s.new + 1
+            end
+            if r.linkId then groups[r.linkId] = true end
+        end
+        for _ in pairs(groups) do s.links = s.links + 1 end
+        return s
+    end
+    importExportPanel.Preview = PreviewImport
+
+    local function ImportDB(text)
+        local records = ParseExport(text)
+        local added, updated = 0, 0
+        local fileGroups = {}   -- link id in the file -> { keys = {...}, main = key }
+        for _, r in ipairs(records) do
+            local key = r.key
+            if db.players[key] then
+                -- Merge: keep higher absolute rating, append note if different
+                local existing = db.players[key]
+                if math.abs(r.rating) > math.abs(People.Rating(existing)) then
+                    People.SetRating(existing, r.rating)
+                end
+                if r.note ~= "" and r.note ~= existing.note then
+                    if (existing.note or "") == "" then
+                        existing.note = r.note
+                    else
+                        existing.note = existing.note .. " | " .. r.note
+                    end
+                end
+                -- Update level if imported is higher
+                if r.level > (existing.level or 0) then
+                    existing.level = r.level
+                end
+                -- Update class/race if we had Unknown
+                if (existing.class or "Unknown") == "Unknown" and r.class ~= "Unknown" then
+                    existing.class = r.class
+                end
+                if (existing.race or "") == "" and r.race ~= "" then
+                    existing.race = r.race
+                end
+                updated = updated + 1
+            else
+                db.players[key] = {
+                    name       = r.name,
+                    realm      = r.realm,
+                    class      = r.class,
+                    race       = r.race,
+                    level      = r.level,
+                    rating     = r.rating,
+                    note       = r.note,
+                    source     = r.source,
+                    seen       = r.seen,
+                    encounters = {},
+                }
+                added = added + 1
+            end
+            -- Nickname only if you haven't given them one; tags add up. A tag
+            -- you don't have becomes one of your own, while there's room.
+            local p = db.players[key]
+            if r.nick and not (p.nick and p.nick ~= "") then Tags.SetNick(p, r.nick) end
+            for _, t in ipairs(r.tags or {}) do
+                local tag = Tags.Find(t) or Tags.AddCustom(t)
+                if tag then
+                    p.tags = p.tags or {}
+                    p.tags[tag] = true
+                end
+            end
+            -- The file's link id only groups its lines; local ids
+            -- are assigned by People.Link, so they can't collide.
+            if r.linkId then
+                local group = fileGroups[r.linkId]
+                if not group then
+                    group = { keys = {} }
+                    fileGroups[r.linkId] = group
+                end
+                group.keys[#group.keys + 1] = key
+                if r.isMain then group.main = key end
+            end
+        end
+        for _, group in pairs(fileGroups) do
+            local main = group.main or group.keys[1]
+            for _, k in ipairs(group.keys) do
+                if k ~= main then People.Link(k, main) end
+            end
+        end
+        People.Reconcile()
         return added, updated
     end
 
@@ -2775,7 +3988,7 @@ do
     -- ScrollFrame + EditBox for the text
     local expScroll = CreateFrame("ScrollFrame", "WTFAYExportScroll", expFrame, "UIPanelScrollFrameTemplate")
     expScroll:SetPoint("TOPLEFT", 14, -52)
-    expScroll:SetPoint("BOTTOMRIGHT", -32, 44)
+    expScroll:SetPoint("BOTTOMRIGHT", -32, 72)   -- room for the import preview
 
     local expEditBox = CreateFrame("EditBox", "WTFAYExportEditBox", expScroll)
     expEditBox:SetMultiLine(true)
@@ -2829,74 +4042,128 @@ do
         expEditBox:HighlightText()
     end
 
+    -- Import mode: a live preview of what Merge would do, under the paste box.
+    local importMode = false
+    local expPreview = expFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    expPreview:SetPoint("BOTTOMLEFT", expFrame, "BOTTOMLEFT", 16, 40)
+    expPreview:SetPoint("RIGHT", expFrame, "RIGHT", -16, 0)
+    expPreview:SetJustifyH("LEFT")
+    expPreview:SetWordWrap(true)
+
+    local function PreviewText(text)
+        if not text or text:trim() == "" then return T.dim .. "Paste an export to see what it contains.|r" end
+        local s = PreviewImport(text)
+        if s.total == 0 then
+            return T.warn .. "Nothing here looks like a WTFAY export.|r"
+        end
+        local known = {}
+        if s.rating > 0 then known[#known + 1] = s.rating .. " rated differently (the stronger rating is kept)" end
+        if s.notes > 0 then known[#known + 1] = s.notes .. " with a new note (added to yours)" end
+        local line = T.white .. s.total .. " player" .. (s.total == 1 and "" or "s") .. "|r: "
+            .. T.on .. s.new .. " new|r, " .. T.manual .. s.known .. " you already know|r"
+            .. (#known > 0 and (" (" .. table.concat(known, ", ") .. ")") or "")
+        if s.links > 0 then line = line .. ", " .. s.links .. " linked group" .. (s.links == 1 and "" or "s") end
+        if s.skipped > 0 then line = line .. ".  " .. T.warn .. s.skipped .. " line" .. (s.skipped == 1 and "" or "s") .. " not understood|r" end
+        local mine = 0
+        for _ in pairs(db.players) do mine = mine + 1 end
+        return line .. "\n" .. T.dim .. "Replace All backs up, then removes, your " .. mine .. " player"
+            .. (mine == 1 and "" or "s") .. " (/wtfay restore undoes it).|r"
+    end
+    importExportPanel.PreviewText = PreviewText
+
+    do
+        local showExport = importExportPanel.ShowExport
+        importExportPanel.ShowExport = function()
+            importMode = false
+            expPreview:SetText("")
+            showExport()
+        end
+    end
+
+    expEditBox:SetScript("OnTextChanged", function(self)
+        if importMode then expPreview:SetText(PreviewText(self:GetText())) end
+    end)
+
+    local function CloseImport()
+        importMode = false
+        expPreview:SetText("")
+        expFrame:Hide()
+        ResetButtons()
+    end
+    expFrame:HookScript("OnHide", function() importMode = false; expPreview:SetText("") end)
+
+    btnMerge:SetScript("OnClick", function()
+        local text = expEditBox:GetText()
+        if text == "" then P("Nothing to import."); CloseImport(); return end
+        local added, updated = ImportDB(text)
+        P("Merge complete: " .. T.on .. added .. " added|r, " .. T.manual .. updated .. " updated|r")
+        RefreshList()
+        CloseImport()
+    end)
+
+    -- Two clicks: Replace All wipes the database, even with a backup behind it.
+    C.ArmConfirm(btnReplace, function()
+        local text = expEditBox:GetText()
+        if text == "" then P("Nothing to import."); CloseImport(); return end
+        if PreviewImport(text).total == 0 then
+            P(T.warn .. "Nothing in that text looks like a WTFAY export - your database is unchanged.|r")
+            return
+        end
+        -- Backup current database before wiping
+        if not db.backups then db.backups = {} end
+        local backup = {}
+        for k, p in pairs(db.players) do
+            backup[k] = {}
+            for field, val in pairs(p) do
+                if field == "encounters" then
+                    backup[k].encounters = {}
+                    for idx, e in ipairs(val) do
+                        local copy = {}
+                        for ek, ev in pairs(e) do copy[ek] = ev end
+                        backup[k].encounters[idx] = copy
+                    end
+                else
+                    backup[k][field] = val
+                end
+            end
+        end
+        -- Keep only the 3 most recent backups
+        table.insert(db.backups, 1, {
+            time    = Timestamp(),
+            count   = 0,  -- updated below
+            players = backup,
+            people  = People.Snapshot(),
+        })
+        local backupCount = 0
+        for _ in pairs(backup) do backupCount = backupCount + 1 end
+        db.backups[1].count = backupCount
+        while #db.backups > 3 do
+            table.remove(db.backups)
+        end
+        P("Backup created (" .. backupCount .. " players saved). Use " .. T.gold .. "/wtfay restore|r to undo.")
+        -- Wipe existing data and import fresh
+        wipe(db.players)
+        wipe(db.people)
+        local added, _ = ImportDB(text)
+        P("Replace complete: " .. T.on .. added .. " players|r imported (old data wiped)")
+        RefreshList()
+        CloseImport()
+    end, T.off .. "Click again|r")
+
+    btnCancel:SetScript("OnClick", CloseImport)
+
     importExportPanel.ShowImport = function()
         expTitle:SetText("|cFF" .. ACCENT .. "Import WTFAY Database|r")
         expHint:SetText(T.dim .. "Paste exported data below. Merge adds new + updates existing. Replace overwrites everything.|r")
+        importMode = true
         expEditBox:SetText("")
+        expPreview:SetText(PreviewText(""))
 
         -- Show import buttons, hide close
         btnClose:Hide()
         btnMerge:Show()
         btnReplace:Show()
         btnCancel:Show()
-
-        btnMerge:SetScript("OnClick", function()
-            local text = expEditBox:GetText()
-            if text == "" then P("Nothing to import."); expFrame:Hide(); ResetButtons(); return end
-            local added, updated = ImportDB(text)
-            P("Merge complete: " .. T.on .. added .. " added|r, " .. T.manual .. updated .. " updated|r")
-            RefreshList()
-            expFrame:Hide()
-            ResetButtons()
-        end)
-
-        btnReplace:SetScript("OnClick", function()
-            local text = expEditBox:GetText()
-            if text == "" then P("Nothing to import."); expFrame:Hide(); ResetButtons(); return end
-            -- Backup current database before wiping
-            if not db.backups then db.backups = {} end
-            local backup = {}
-            for k, p in pairs(db.players) do
-                backup[k] = {}
-                for field, val in pairs(p) do
-                    if field == "encounters" then
-                        backup[k].encounters = {}
-                        for idx, e in ipairs(val) do
-                            local copy = {}
-                            for ek, ev in pairs(e) do copy[ek] = ev end
-                            backup[k].encounters[idx] = copy
-                        end
-                    else
-                        backup[k][field] = val
-                    end
-                end
-            end
-            -- Keep only the 3 most recent backups
-            table.insert(db.backups, 1, {
-                time    = Timestamp(),
-                count   = 0,  -- updated below
-                players = backup,
-            })
-            local backupCount = 0
-            for _ in pairs(backup) do backupCount = backupCount + 1 end
-            db.backups[1].count = backupCount
-            while #db.backups > 3 do
-                table.remove(db.backups)
-            end
-            P("Backup created (" .. backupCount .. " players saved). Use " .. T.gold .. "/wtfay restore|r to undo.")
-            -- Wipe existing data and import fresh
-            wipe(db.players)
-            local added, _ = ImportDB(text)
-            P("Replace complete: " .. T.on .. added .. " players|r imported (old data wiped)")
-            RefreshList()
-            expFrame:Hide()
-            ResetButtons()
-        end)
-
-        btnCancel:SetScript("OnClick", function()
-            expFrame:Hide()
-            ResetButtons()
-        end)
 
         expFrame:Show()
         expEditBox:SetFocus()
@@ -3006,7 +4273,7 @@ do
             if p.pending then -- skip inbox players from stats
             else
             totalPlayers = totalPlayers + 1
-            local r = p.rating or 0
+            local r = People.Rating(p)
             ratingSum = ratingSum + r
 
             if r == -3 then countBlacklist = countBlacklist + 1
@@ -3034,7 +4301,9 @@ do
         local avgRating = totalPlayers > 0 and (ratingSum / totalPlayers) or 0
         local avgStr = string.format("%.1f", avgRating)
 
-        lineTotalPlayers:SetText(T.white .. "Total Players:|r  |cFF" .. ACCENT .. totalPlayers .. "|r")
+        local extraChars = People.ExtraCharacters()
+        lineTotalPlayers:SetText(T.white .. "Total Players:|r  |cFF" .. ACCENT .. totalPlayers .. "|r"
+            .. (extraChars > 0 and ("  " .. T.dim .. "(" .. (totalPlayers - extraChars) .. " people)|r") or ""))
         lineAvgRating:SetText(T.white .. "Average Rating:|r  " .. C.RatingIcon(math.floor(avgRating + 0.5)) .. ColorRating(math.floor(avgRating + 0.5)) .. " " .. T.dim .. "(" .. avgStr .. ")|r")
 
         lineRatingHeader:SetText("|cFF" .. ACCENT .. "Rating Breakdown|r")
@@ -3288,6 +4557,9 @@ StaticPopupDialogs["WTFAY_EDIT_NOTE"] = {
                 note = eb:GetText() or ""
             end
             D("WTFAY_EDIT_NOTE note='" .. note .. "'")
+            local dialog = StaticPopupDialogs["WTFAY_EDIT_NOTE"]
+            dialog.saved = true
+            dialog.drafts[key] = nil
             db.players[key].note = note
             if note ~= "" and db.players[key].pending then
                 db.players[key].pending = nil
@@ -3307,8 +4579,16 @@ StaticPopupDialogs["WTFAY_EDIT_NOTE"] = {
             D("WTFAY_EDIT_NOTE OnShow: key=" .. tostring(key))
             local eb = self.editBox or _G[self:GetName() .. "EditBox"]
             D("WTFAY_EDIT_NOTE OnShow editBox=" .. tostring(eb))
+            local dialog = StaticPopupDialogs["WTFAY_EDIT_NOTE"]
+            dialog.saved, dialog.discarded = nil, nil
+            dialog.editingKey = key
+            dialog.original = key and db and db.players[key] and (db.players[key].note or "") or ""
             if eb then
-                if key and db and db.players[key] then
+                local draft = key and dialog.drafts[key]
+                if draft then
+                    eb:SetText(draft)
+                    P("Restored your unsaved note for " .. db.players[key].name .. ". Cancel throws it away.")
+                elseif key and db and db.players[key] then
                     eb:SetText(db.players[key].note or "")
                 else
                     eb:SetText("")
@@ -3326,6 +4606,29 @@ StaticPopupDialogs["WTFAY_EDIT_NOTE"] = {
         end)
         if not ok then D("EDIT_NOTE OnShow ERROR: " .. tostring(err)) end
     end,
+    -- Only the Cancel button discards. Escape, another popup taking this one's
+    -- place, or closing the window keeps the text as a draft, which comes
+    -- back the next time this player's note is opened.
+    OnCancel = function(self, data, reason)
+        if reason == "clicked" then
+            local dialog = StaticPopupDialogs["WTFAY_EDIT_NOTE"]
+            dialog.discarded = true
+            if dialog.editingKey then dialog.drafts[dialog.editingKey] = nil end
+        end
+    end,
+    OnHide = function(self)
+        local dialog = StaticPopupDialogs["WTFAY_EDIT_NOTE"]
+        local key = dialog.editingKey
+        dialog.editingKey = nil
+        if not key or dialog.saved or dialog.discarded then return end
+        local eb = self.editBox or (self.GetName and _G[self:GetName() .. "EditBox"])
+        local text = eb and eb:GetText() or ""
+        if text ~= (dialog.original or "") and db and db.players[key] then
+            dialog.drafts[key] = text
+            P("Unsaved note for " .. db.players[key].name .. " kept - open Edit Note again to finish it.")
+        end
+    end,
+    drafts = {},   -- key -> unsaved text, for this session
     timeout = 0,
     whileDead = true,
     hideOnEscape = true,
@@ -3337,42 +4640,6 @@ StaticPopupDialogs["WTFAY_EDIT_NOTE"] = {
 -- Visual Rating Picker (replaces the old text-input popup)
 ----------------------------------------------------------------------
 local ratingPicker = CreateFrame("Frame", "WTFAYRatingPicker", UIParent)
-ratingPicker:SetSize(320, 130)
-ratingPicker:SetPoint("CENTER", UIParent, "CENTER", 0, 120)
-ratingPicker:SetFrameStrata("FULLSCREEN_DIALOG")
-ratingPicker:SetMovable(true)
-ratingPicker:EnableMouse(true)
-ratingPicker:RegisterForDrag("LeftButton")
-ratingPicker:SetClampedToScreen(true)
-ratingPicker:SetScript("OnDragStart", function(s) s:StartMoving() end)
-ratingPicker:SetScript("OnDragStop", function(s) s:StopMovingOrSizing() end)
-ratingPicker:Hide()
-
-if BackdropTemplateMixin then
-    Mixin(ratingPicker, BackdropTemplateMixin)
-    ratingPicker:OnBackdropLoaded()
-end
-C.SkinPanel(ratingPicker, { edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
-ratingPicker:SetToplevel(true)
-
--- Close on Escape
-do
-    local name = ratingPicker:GetName()
-    if name then tinsert(UISpecialFrames, name) end
-end
-
--- Title
-local rpTitle = ratingPicker:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-rpTitle:SetPoint("TOP", ratingPicker, "TOP", 0, -12)
-
--- Subtitle labels
-local rpBad = ratingPicker:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-rpBad:SetPoint("TOPLEFT", ratingPicker, "TOPLEFT", 14, -30)
-rpBad:SetText(T.off .. "Avoid|r")
-
-local rpGood = ratingPicker:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-rpGood:SetPoint("TOPRIGHT", ratingPicker, "TOPRIGHT", -14, -30)
-rpGood:SetText(T.on .. "Great|r")
 
 -- Rating labels for display
 local RATING_LABELS = {
@@ -3387,131 +4654,306 @@ local RATING_LABELS = {
     [5]  = "Legend",
 }
 
--- Create 9 buttons for -3 to +5
-local ratingButtons = {}
-local BTN_SIZE = 30
-local BTN_GAP = 2
-local totalW = 9 * BTN_SIZE + 8 * BTN_GAP
-local startX = (320 - totalW) / 2
+-- Rate, tag and write a note in one place. Ratings and tags save as you
+-- click, the note when you press Enter or close the window (Done, Escape,
+-- Link..., More...), so it stays open until you're finished.
+do
+    local W = 360
+    local BTN_SIZE, BTN_GAP = 32, 3
+    local BTN_Y = -66                 -- centre line of the rating buttons
+    local CHIP_TOP, CHIP_H, CHIP_GAP = -132, 20, 4
+    -- Tags that are a warning, so they light up red instead of green.
+    local NEGATIVE = { ["AFK"] = true, ["Ninja looter"] = true, ["Rude"] = true }
 
-for i = -3, 5 do
-    local idx = i + 4  -- 1-based index
-    local btn = CreateFrame("Button", nil, ratingPicker)
-    btn:SetSize(BTN_SIZE, BTN_SIZE)
-    btn:SetPoint("TOPLEFT", ratingPicker, "TOPLEFT", startX + (idx - 1) * (BTN_SIZE + BTN_GAP), -44)
+    local rp = ratingPicker
+    rp:SetSize(W, 200)
+    rp:SetPoint("CENTER", UIParent, "CENTER", 0, 120)
+    rp:SetFrameStrata("FULLSCREEN_DIALOG")
+    rp:SetMovable(true)
+    rp:EnableMouse(true)
+    rp:RegisterForDrag("LeftButton")
+    rp:SetClampedToScreen(true)
+    rp:SetScript("OnDragStart", function(s) s:StartMoving() end)
+    rp:SetScript("OnDragStop", function(s) s:StopMovingOrSizing() end)
+    rp:Hide()
+    if BackdropTemplateMixin then
+        Mixin(rp, BackdropTemplateMixin)
+        rp:OnBackdropLoaded()
+    end
+    C.SkinPanel(rp, { edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
+    rp:SetToplevel(true)
+    tinsert(UISpecialFrames, rp:GetName())   -- Escape closes it
 
-    -- Color the button background based on rating
-    local r, g, b
-    if i < 0 then
-        local pct = (i + 3) / 3  -- 0 at -3, 1 at 0
-        r, g, b = 1.0, pct * 0.6, 0
-    else
-        local pct = i / 5  -- 0 at 0, 1 at 5
-        r, g, b = 1.0 - pct * 0.7, 0.5 + pct * 0.5, 0
+    local function Fill(tex, r, g, b, a)
+        if tex.SetColorTexture then tex:SetColorTexture(r, g, b, a) else tex:SetTexture(r, g, b, a) end
     end
 
-    local bg = btn:CreateTexture(nil, "BACKGROUND")
-    bg:SetAllPoints()
-    if bg.SetColorTexture then
-        bg:SetColorTexture(r, g, b, 0.85)
-    else
-        bg:SetTexture(r, g, b, 0.85)
+    local title = rp:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", rp, "TOP", 0, -14)
+
+    local bad = rp:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    bad:SetPoint("TOPLEFT", rp, "TOPLEFT", 18, -32)
+    bad:SetText(T.off .. "Avoid|r")
+    local good = rp:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    good:SetPoint("TOPRIGHT", rp, "TOPRIGHT", -18, -32)
+    good:SetText(T.on .. "Great|r")
+
+    -- One line under the buttons: what a button means while you hover it,
+    -- otherwise the rating they have now.
+    local desc = rp:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    desc:SetPoint("TOP", rp, "TOP", 0, BTN_Y - BTN_SIZE / 2 - 12)
+
+    local tagsLabel = rp:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    tagsLabel:SetPoint("TOPLEFT", rp, "TOPLEFT", 18, CHIP_TOP + 18)
+    tagsLabel:SetText(T.soft .. "Tags|r")
+
+    local rateKey
+    local buttons, chips = {}, {}
+
+    local function Player() return rateKey and db and db.players[rateKey] end
+
+    local function ShowNow()
+        local p = Player()
+        if not p then desc:SetText(""); return end
+        local r = People.Rating(p)
+        desc:SetText(T.dim .. "Now: |r" .. C.RatingIcon(r) .. ColorRating(r) .. "  " .. T.white .. (RATING_LABELS[r] or "") .. "|r")
     end
 
-    -- Highlight on hover
-    local hl = btn:CreateTexture(nil, "HIGHLIGHT")
-    hl:SetAllPoints()
-    if hl.SetColorTexture then
-        hl:SetColorTexture(1, 1, 1, 0.3)
-    else
-        hl:SetTexture(1, 1, 1, 0.3)
-    end
-
-    -- Number label
-    local label = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    label:SetPoint("CENTER", btn, "CENTER", 0, 0)
-    local sign = i > 0 and "+" or ""
-    label:SetText(T.white .. sign .. i .. "|r")
-
-    btn.ratingValue = i
-    btn.bgTex = bg
-    ratingButtons[idx] = btn
-end
-
--- Description text (updates on hover)
-local rpDesc = ratingPicker:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-rpDesc:SetPoint("TOP", ratingPicker, "TOP", 0, -80)
-rpDesc:SetText("")
-
--- Current rating indicator
-local rpCurrent = ratingPicker:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-rpCurrent:SetPoint("TOP", rpDesc, "BOTTOM", 0, -2)
-rpCurrent:SetText("")
-
--- Cancel button
-local rpCancel = CreateFrame("Button", nil, ratingPicker, C.ButtonTemplate)
-rpCancel:SetSize(70, 22)
-rpCancel:SetPoint("BOTTOM", ratingPicker, "BOTTOM", 0, 10)
-rpCancel:SetText("Cancel")
-rpCancel:SetScript("OnClick", function() ratingPicker:Hide() end)
-
--- Set up hover and click for each button
-for idx, btn in ipairs(ratingButtons) do
-    btn:SetScript("OnEnter", function(self)
-        local v = self.ratingValue
-        rpDesc:SetText(T.white .. RATING_LABELS[v] .. "|r")
-    end)
-    btn:SetScript("OnLeave", function()
-        rpDesc:SetText("")
-    end)
-    btn:SetScript("OnClick", function(self)
-        local ok, err = pcall(function()
-            local key = popupActiveKey
-            D("RatingPicker click: val=" .. self.ratingValue .. " key=" .. tostring(key))
-            if not key or not db or not db.players[key] then return end
-            db.players[key].rating = self.ratingValue
-            local wasPending = db.players[key].pending
-            if wasPending then
-                db.players[key].pending = nil
-                P(db.players[key].name .. " rated " .. ColorRating(self.ratingValue) .. " " .. T.on .. "(moved to database)|r")
-            else
-                P(db.players[key].name .. " rated " .. ColorRating(self.ratingValue))
-            end
-            RefreshList()
-            if RefreshInbox then RefreshInbox() end
-            UpdateInboxTabLabel()
-            ratingPicker:Hide()
-            -- Auto-open note editor for players coming from inbox
-            if wasPending then
-                popupActiveKey = key
-                StaticPopup_Show("WTFAY_EDIT_NOTE", db.players[key].name)
-            end
-        end)
-        if not ok then D("RatingPicker ERROR: " .. tostring(err)) end
-    end)
-end
-
--- Public function to show the picker
-ShowRatingPicker = function(key)
-    popupActiveKey = key
-    local p = db and db.players[key]
-    if not p then return end
-    rpTitle:SetText("Rate " .. ClassColor(p.class) .. p.name .. "|r")
-    rpCurrent:SetText(T.dim .. "Current: |r" .. C.RatingIcon(p.rating or 0) .. ColorRating(p.rating or 0))
-
-    -- Highlight current rating button with a border effect
-    for idx, btn in ipairs(ratingButtons) do
-        if btn.ratingValue == (p.rating or 0) then
-            btn.bgTex:SetAlpha(1.0)
-            -- Make current one slightly bigger to stand out
-            btn:SetSize(BTN_SIZE + 4, BTN_SIZE + 4)
-        else
-            btn.bgTex:SetAlpha(0.7)
-            btn:SetSize(BTN_SIZE, BTN_SIZE)
+    local function Decided(p, wasPending)
+        if wasPending and not p.pending then
+            P(p.name .. " " .. T.on .. "moved to your database.|r")
         end
     end
 
-    ratingPicker:Show()
+    -- The note: this character's own (linked characters keep theirs).
+    local noteLabel = rp:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    noteLabel:SetText(T.soft .. "Note|r  " .. T.dim .. "(saved when you press Enter or close this window)|r")
+    local noteBox = CreateFrame("EditBox", "WTFAYRatingPickerNote", rp, "InputBoxTemplate")
+    noteBox:SetSize(W - 42, 20)
+    noteBox:SetAutoFocus(false)
+    noteBox:SetMaxLetters(255)
+
+    local function SaveNote()
+        local p = Player()
+        if not p then return end
+        local text = (noteBox:GetText() or ""):gsub("[\r\n]", " ")
+        text = text:trim()
+        if text == (p.note or "") then return end
+        local wasPending = p.pending
+        p.note = text
+        if text ~= "" then p.pending = nil end
+        local editor = StaticPopupDialogs["WTFAY_EDIT_NOTE"]
+        if editor and editor.drafts then editor.drafts[rateKey] = nil end
+        P("Note " .. (text == "" and "cleared" or "saved") .. " for " .. p.name .. ".")
+        Decided(p, wasPending)
+        People.Changed()
+    end
+    noteBox:SetScript("OnEnterPressed", function(self)
+        self:ClearFocus()
+        SaveNote()
+    end)
+    noteBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+
+    local totalW = 9 * BTN_SIZE + 8 * BTN_GAP
+    local startX = (W - totalW) / 2
+    for i = -3, 5 do
+        local idx = i + 4
+        local btn = CreateFrame("Button", nil, rp)
+        btn:SetSize(BTN_SIZE, BTN_SIZE)
+        -- Anchored by its centre, so the bigger "current" button grows evenly
+        -- instead of spilling over its right-hand neighbour.
+        btn:SetPoint("CENTER", rp, "TOPLEFT", startX + (idx - 1) * (BTN_SIZE + BTN_GAP) + BTN_SIZE / 2, BTN_Y)
+
+        local r, g, b
+        if i < 0 then
+            local pct = (i + 3) / 3            -- 0 at -3, 1 at 0
+            r, g, b = 1.0, pct * 0.6, 0
+        else
+            local pct = i / 5                  -- 0 at 0, 1 at 5
+            r, g, b = 1.0 - pct * 0.7, 0.5 + pct * 0.5, 0
+        end
+        local bg = btn:CreateTexture(nil, "BACKGROUND")
+        bg:SetAllPoints()
+        Fill(bg, r, g, b, 0.85)
+        local hl = btn:CreateTexture(nil, "HIGHLIGHT")
+        hl:SetAllPoints()
+        Fill(hl, 1, 1, 1, 0.3)
+
+        local label = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        label:SetPoint("CENTER", btn, "CENTER", 0, 0)
+        label:SetText(T.white .. (i > 0 and "+" or "") .. i .. "|r")
+
+        btn.ratingValue = i
+        btn.bgTex = bg
+        btn:SetScript("OnEnter", function(self)
+            desc:SetText(ColorRating(self.ratingValue) .. "  " .. T.white .. RATING_LABELS[self.ratingValue] .. "|r")
+        end)
+        btn:SetScript("OnLeave", ShowNow)
+        btn:SetScript("OnClick", function(self)
+            local ok, err = pcall(function()
+                local p = Player()
+                D("RatingPicker click: val=" .. self.ratingValue .. " key=" .. tostring(rateKey))
+                if not p then return end
+                local wasPending = p.pending
+                People.SetRating(p, self.ratingValue)
+                p.pending = nil
+                P(p.name .. " rated " .. ColorRating(self.ratingValue))
+                Decided(p, wasPending)
+                People.Changed()   -- refreshes this window too
+            end)
+            if not ok then D("RatingPicker ERROR: " .. tostring(err)) end
+        end)
+        buttons[idx] = btn
+    end
+
+    local function Chip(i)
+        if chips[i] then return chips[i] end
+        local c = CreateFrame("Button", nil, rp)
+        c:SetHeight(CHIP_H)
+        c.bg = c:CreateTexture(nil, "BACKGROUND")
+        c.bg:SetAllPoints()
+        local hl = c:CreateTexture(nil, "HIGHLIGHT")
+        hl:SetAllPoints()
+        Fill(hl, 1, 1, 1, 0.15)
+        c.label = c:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        c.label:SetPoint("CENTER", c, "CENTER", 0, 0)
+        c:SetScript("OnClick", function(self)
+            local p = Player()
+            if not p then return end
+            local wasPending = p.pending
+            Tags.Set(p, self.tag, not self.own)
+            Decided(p, wasPending)
+            People.Changed()
+        end)
+        c:SetScript("OnEnter", function(self)
+            if not self.altOnly and not Tags.IsCustom(self.tag) then return end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText(self.tag, 1, 0.82, 0)
+            if self.altOnly then
+                GameTooltip:AddLine("Tagged on one of their linked characters. Click to tag this one too.", 1, 1, 1, true)
+            end
+            if Tags.IsCustom(self.tag) then
+                GameTooltip:AddLine("Your own tag. Rename or delete it under More...", 0.7, 0.7, 0.7, true)
+            end
+            GameTooltip:Show()
+        end)
+        c:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        chips[i] = c
+        return c
+    end
+
+    -- Lay the tags out like words in a paragraph and size the window to fit.
+    local function LayoutChips(p)
+        local _, whole = Tags.Of(p)    -- including linked characters'
+        local all = Tags.All()
+        local x, y = 18, CHIP_TOP
+        for i, tag in ipairs(all) do
+            local c = Chip(i)
+            local own = p.tags and p.tags[tag] and true or false
+            c.tag, c.own, c.altOnly = tag, own, (not own and whole[tag]) and true or false
+            if own then
+                if NEGATIVE[tag] then Fill(c.bg, 0.6, 0.12, 0.08, 0.95) else Fill(c.bg, 0.16, 0.48, 0.16, 0.95) end
+                c.label:SetText(T.white .. tag .. "|r")
+            else
+                Fill(c.bg, 0.12, 0.12, 0.12, 0.85)
+                local color = c.altOnly and T.manual or (Tags.IsCustom(tag) and T.light or T.dim)
+                c.label:SetText(color .. tag .. (c.altOnly and "*" or "") .. "|r")
+            end
+            local w = math.floor((c.label:GetStringWidth() or 40) + 14)
+            if x > 18 and x + w > W - 18 then
+                x, y = 18, y - CHIP_H - CHIP_GAP
+            end
+            c:SetWidth(w)
+            c:ClearAllPoints()
+            c:SetPoint("TOPLEFT", rp, "TOPLEFT", x, y)
+            c:Show()
+            x = x + w + CHIP_GAP
+        end
+        for i = #all + 1, #chips do chips[i]:Hide() end
+        -- The note goes under the tags; the buttons sit at the bottom.
+        local noteTop = y - CHIP_H - 12
+        noteLabel:ClearAllPoints()
+        noteLabel:SetPoint("TOPLEFT", rp, "TOPLEFT", 18, noteTop)
+        noteBox:ClearAllPoints()
+        noteBox:SetPoint("TOPLEFT", rp, "TOPLEFT", 24, noteTop - 16)
+        rp:SetHeight(-(noteTop - 16 - 20) + 12 + 22 + 14)
+    end
+
+    function rp.Refresh()
+        local p = Player()
+        if not p then rp:Hide(); return end
+        local linkedCount = #People.Others(p)
+        title:SetText("Rate " .. ClassColor(p.class) .. p.name .. "|r"
+            .. (linkedCount > 0 and (T.dim .. " + " .. linkedCount .. " linked|r") or ""))
+        local current = People.Rating(p)
+        for _, btn in ipairs(buttons) do
+            if btn.ratingValue == current then
+                btn.bgTex:SetAlpha(1.0)
+                btn:SetSize(BTN_SIZE + 6, BTN_SIZE + 6)
+            else
+                btn.bgTex:SetAlpha(0.6)
+                btn:SetSize(BTN_SIZE, BTN_SIZE)
+            end
+        end
+        ShowNow()
+        LayoutChips(p)
+    end
+
+    local doneBtn = CreateFrame("Button", nil, rp, C.ButtonTemplate)
+    doneBtn:SetSize(80, 22)
+    doneBtn:SetPoint("BOTTOM", rp, "BOTTOM", 0, 12)
+    doneBtn:SetText("Done")
+    doneBtn:SetScript("OnClick", function() rp:Hide() end)
+
+    -- This window is what the game's right-click menu opens, so it's also the
+    -- quickest route to "this is someone's alt" for a player you've just met.
+    local linkBtn = CreateFrame("Button", nil, rp, C.ButtonTemplate)
+    linkBtn:SetSize(70, 22)
+    linkBtn:SetPoint("RIGHT", doneBtn, "LEFT", -6, 0)
+    linkBtn:SetText("Link...")
+    linkBtn:SetScript("OnClick", function()
+        local key = rateKey
+        rp:Hide()
+        People.ShowPicker(key)
+    end)
+
+    -- Nickname, and adding / renaming / deleting your own tags.
+    local moreBtn = CreateFrame("Button", nil, rp, C.ButtonTemplate)
+    moreBtn:SetSize(70, 22)
+    moreBtn:SetPoint("LEFT", doneBtn, "RIGHT", 6, 0)
+    moreBtn:SetText("More...")
+    moreBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Tags & Nickname", 1, 0.82, 0)
+        GameTooltip:AddLine("Give them a nickname, or add, rename and delete tags of your own.", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    moreBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    moreBtn:SetScript("OnClick", function()
+        local key = rateKey
+        rp:Hide()
+        if Tags.ShowPicker then Tags.ShowPicker(key) end
+    end)
+
+    -- However it closes, the note is kept: Done, Escape, Link..., More...
+    rp:SetScript("OnHide", function()
+        noteBox:ClearFocus()
+        SaveNote()
+    end)
+
+    ShowRatingPicker = function(key)
+        local p = key and db and db.players[key]
+        if not p then return end
+        -- Opening it for someone else keeps what was typed for the last one.
+        if rp:IsShown() and rateKey and rateKey ~= key then SaveNote() end
+        popupActiveKey = key
+        rateKey = key
+        -- An unsaved draft from the note editor wins over the stored note.
+        local editor = StaticPopupDialogs["WTFAY_EDIT_NOTE"]
+        noteBox:SetText((editor and editor.drafts and editor.drafts[key]) or p.note or "")
+        rp.Refresh()
+        rp:Show()
+    end
 end
 
 StaticPopupDialogs["WTFAY_CONFIRM_REMOVE"] = {
@@ -3524,6 +4966,7 @@ StaticPopupDialogs["WTFAY_CONFIRM_REMOVE"] = {
             D("WTFAY_CONFIRM_REMOVE OnAccept: key=" .. tostring(key))
             if key and db and db.players[key] then
                 local name = db.players[key].name
+                People.Unlink(key)
                 db.players[key] = nil
                 P("Removed " .. name)
                 RefreshList()
@@ -3602,7 +5045,85 @@ detailMet:SetPoint("RIGHT", detail, "RIGHT", -14, 0)
 detailMet:SetJustifyH("LEFT")
 detailMet:SetWordWrap(false)
 
-encHeader:SetPoint("TOPLEFT", detailMet, "BOTTOMLEFT", 0, -10)
+-- "Same player: Felcaster (main), Natureboi". Left-click a name to open that
+-- character, right-click for its menu. Collapses to nothing when unlinked.
+do
+    local peopleRow = CreateFrame("Frame", nil, detail)
+    peopleRow:SetPoint("TOPLEFT", detailMet, "BOTTOMLEFT", 0, -4)
+    peopleRow:SetPoint("RIGHT", detail, "RIGHT", -14, 0)
+    peopleRow:SetHeight(1)
+    detail.peopleRow = peopleRow
+
+    local label = peopleRow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    label:SetPoint("LEFT", peopleRow, "LEFT", 0, 0)
+    label:SetText(T.accent .. "Same player:|r")
+
+    local more = peopleRow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+
+    local buttons = {}
+    local function NameButton(i)
+        local b = buttons[i]
+        if b then return b end
+        b = CreateFrame("Button", nil, peopleRow)
+        b:SetHeight(16)
+        b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        b.text = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        b.text:SetPoint("LEFT", b, "LEFT", 0, 0)
+        b:SetScript("OnClick", function(self, mouse)
+            if mouse == "RightButton" then
+                RowMenu(self)
+            elseif self.playerKey then
+                ShowDetailPanel(self.playerKey)
+            end
+        end)
+        b:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Left-click to open, right-click for options", 1, 1, 1)
+            GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        buttons[i] = b
+        return b
+    end
+
+    -- Returns true when the row is showing.
+    function detail.RefreshPeopleRow(p)
+        local others, keys = People.Others(p)
+        for _, b in ipairs(buttons) do b:Hide() end
+        more:SetText("")
+        if #others == 0 then
+            peopleRow:SetHeight(1)
+            label:Hide()
+            return false
+        end
+        peopleRow:SetHeight(18)
+        label:Show()
+
+        local AVAILABLE, used, shown = 312, label:GetStringWidth() + 6, 0
+        local prev = label
+        for i, other in ipairs(others) do
+            local b = NameButton(i)
+            local isMain = People.IsMain(other)
+            b.playerKey = keys[i]
+            b.text:SetText(ClassColor(other.class) .. other.name .. "|r" .. (isMain and (T.dim .. " (main)|r") or ""))
+            local width = b.text:GetStringWidth() + 8
+            if used + width > AVAILABLE and shown > 0 then break end
+            b:SetWidth(width)
+            b:ClearAllPoints()
+            b:SetPoint("LEFT", prev, "RIGHT", 6, 0)
+            b:Show()
+            used, shown, prev = used + width, shown + 1, b
+        end
+        if shown < #others then
+            more:ClearAllPoints()
+            more:SetPoint("LEFT", prev, "RIGHT", 4, 0)
+            more:SetText(T.dim .. "+" .. (#others - shown) .. "|r")
+        end
+        return true
+    end
+end
+
+encHeader:SetPoint("TOPLEFT", detail.peopleRow, "BOTTOMLEFT", 0, -8)
 encHeader:SetText("|cFF" .. ACCENT .. "Encounter History|r")
 
 -- Encounter count
@@ -3640,6 +5161,20 @@ do
         if e.subzone then where = where .. " - " .. e.subzone end
         GameTooltip:SetText(where, 1, 0.82, 0)
         GameTooltip:AddLine((e.time or "?") .. "  (" .. (e.source or "?") .. ")", 0.8, 0.8, 0.8)
+        if row.owner then GameTooltip:AddLine("As " .. row.owner.name, 1, 1, 1) end
+        if e.role and ROLE_LABELS[e.role] then GameTooltip:AddLine("Role: " .. ROLE_LABELS[e.role], 1, 1, 1) end
+        -- One entry covers the whole time you stayed grouped (see LogEncounter).
+        local mins = (e.till and e._ts) and math.floor((e.till - e._ts) / 60) or 0
+        if mins >= 1 then
+            GameTooltip:AddLine("Grouped for " .. Outings.FormatDuration(e.till - e._ts) .. ", until " .. date("%H:%M", e.till), 1, 1, 1)
+        end
+        -- Who else was in that group, and what you noted about the group.
+        local o = Outings.Get(e.outing)
+        if o then
+            local with = Outings.WithText(o, row.ownerKey, 6)
+            if with ~= "" then GameTooltip:AddLine("With " .. with, 1, 1, 1, true) end
+            if o.note then GameTooltip:AddLine(T.dim .. "Group note: |r" .. o.note, 1, 1, 1, true) end
+        end
         if e.lvl then GameTooltip:AddLine("They were level " .. e.lvl, 1, 1, 1) end
         if e.myLvl then GameTooltip:AddLine("You were level " .. e.myLvl, 1, 1, 1) end
         if e.remote then
@@ -3693,7 +5228,7 @@ nextBtn:SetNormalFontObject(GameFontNormalSmall)
 
 -- Action buttons at bottom
 local detailRateBtn = CreateFrame("Button", nil, detail, C.ButtonTemplate)
-detailRateBtn:SetSize(70, 20)
+detailRateBtn:SetSize(56, 20)
 detailRateBtn:SetPoint("BOTTOMLEFT", detail, "BOTTOMLEFT", 10, 8)
 detailRateBtn:SetText("Rate")
 detailRateBtn:SetNormalFontObject(GameFontNormalSmall)
@@ -3702,7 +5237,7 @@ detailRateBtn:SetScript("OnClick", function()
 end)
 
 local detailNoteBtn = CreateFrame("Button", nil, detail, C.ButtonTemplate)
-detailNoteBtn:SetSize(80, 20)
+detailNoteBtn:SetSize(72, 20)
 detailNoteBtn:SetPoint("LEFT", detailRateBtn, "RIGHT", 4, 0)
 detailNoteBtn:SetText("Edit Note")
 detailNoteBtn:SetNormalFontObject(GameFontNormalSmall)
@@ -3713,9 +5248,22 @@ detailNoteBtn:SetScript("OnClick", function()
     end
 end)
 
+-- Tags and nickname, between the note and Remove.
+do
+    local detailTagsBtn = CreateFrame("Button", nil, detail, C.ButtonTemplate)
+    detailTagsBtn:SetSize(50, 20)
+    detailTagsBtn:SetPoint("LEFT", detailNoteBtn, "RIGHT", 4, 0)
+    detailTagsBtn:SetText("Tags...")
+    detailTagsBtn:SetNormalFontObject(GameFontNormalSmall)
+    detailTagsBtn:SetScript("OnClick", function()
+        if detailCurrentKey and Tags.ShowPicker then Tags.ShowPicker(detailCurrentKey) end
+    end)
+    detail.tagsBtn = detailTagsBtn
+end
+
 local detailRemoveBtn = CreateFrame("Button", nil, detail, C.ButtonTemplate)
-detailRemoveBtn:SetSize(70, 20)
-detailRemoveBtn:SetPoint("LEFT", detailNoteBtn, "RIGHT", 4, 0)
+detailRemoveBtn:SetSize(64, 20)
+detailRemoveBtn:SetPoint("LEFT", detail.tagsBtn, "RIGHT", 4, 0)
 detailRemoveBtn:SetText(T.off .. "Remove|r")
 detailRemoveBtn:SetNormalFontObject(GameFontNormalSmall)
 -- Two clicks within 3s; the row context menu keeps its popup, since a menu
@@ -3728,6 +5276,18 @@ C.ArmConfirm(detailRemoveBtn, function()
     end
 end)
 
+-- Link to another character (or, once linked, unlink from the same window).
+do
+    local detailLinkBtn = CreateFrame("Button", nil, detail, C.ButtonTemplate)
+    detailLinkBtn:SetSize(56, 20)
+    detailLinkBtn:SetPoint("LEFT", detailRemoveBtn, "RIGHT", 4, 0)
+    detailLinkBtn:SetText("Link...")
+    detailLinkBtn:SetNormalFontObject(GameFontNormalSmall)
+    detailLinkBtn:SetScript("OnClick", function()
+        if detailCurrentKey then People.ShowPicker(detailCurrentKey) end
+    end)
+end
+
 -- Refresh the detail panel for the current player and page
 local function RefreshDetailPanel()
     local key = detailCurrentKey
@@ -3739,25 +5299,43 @@ local function RefreshDetailPanel()
     local p = db.players[key]
     local cc = ClassColor(p.class)
 
-    detailTitle:SetText(cc .. p.name .. "|r")
+    local nick = Tags.Nick(p)
+    detailTitle:SetText(cc .. p.name .. "|r" .. (nick and ("  " .. T.soft .. "\"" .. nick .. "\"|r") or ""))
 
     local raceStr = (p.race and p.race ~= "") and (p.race .. " ") or ""
     local guildStr = (p.guild and p.guild ~= "") and ("  " .. T.guild .. "<" .. p.guild .. ">|r") or ""
     local zoneStr  = (p.zone and p.zone ~= "") and ("  " .. T.faint .. "seen in " .. p.zone .. "|r") or ""
     detailInfo:SetText(T.soft .. "Lv " .. (p.level or "?") .. "  " .. raceStr .. "|r" .. cc .. (p.class or "Unknown") .. "|r  " .. T.dim .. (p.realm or "") .. "|r" .. guildStr .. zoneStr)
 
-    detailRating:SetText("Rating: " .. C.RatingIcon(p.rating or 0) .. ColorRating(p.rating or 0) .. "  " .. T.muted .. (RATING_LABELS[p.rating or 0] or "") .. "|r")
+    local roles = People.RoleSummary(p)
+    detailRating:SetText("Rating: " .. C.RatingIcon(People.Rating(p)) .. ColorRating(People.Rating(p)) .. "  " .. T.muted .. (RATING_LABELS[People.Rating(p)] or "") .. "|r"
+        .. (roles and ("    " .. T.soft .. roles .. "|r") or ""))
 
-    if p.note and p.note ~= "" then
-        detailNote:SetText(T.text .. p.note .. "|r")
+    -- Tags, their own note, then what you wrote on their other characters.
+    local noteLines = {}
+    local tagText = Tags.Text(p)
+    if tagText then noteLines[1] = T.manual .. "Tags: " .. tagText .. "|r" end
+    if p.note and p.note ~= "" then noteLines[#noteLines + 1] = T.text .. p.note .. "|r" end
+    for _, other in ipairs(People.OtherNotes(p)) do
+        noteLines[#noteLines + 1] = T.dim .. other.name .. ": |r" .. T.text .. other.note .. "|r"
+    end
+    if #noteLines > 0 then
+        detailNote:SetText(table.concat(noteLines, "\n"))
     else
         detailNote:SetText(T.faint .. "(no note)|r")
     end
 
-    -- Encounters: display newest first
-    local enc = p.encounters or {}
+    local linked = detail.RefreshPeopleRow(p)
+
+    -- Encounters: display newest first, across all of this player's characters
+    local enc, owners = People.Encounters(p)
     local totalEnc = #enc
-    encCount:SetText(T.dim .. "(" .. totalEnc .. " total)|r")
+    encCount:SetText(T.dim .. "(" .. totalEnc .. " total" .. (owners and ", all characters" or "") .. ")|r")
+
+    -- Grow for the "Same player" row and for notes running past one line, so
+    -- neither pushes the history into the buttons at the bottom.
+    local noteHeight = detailNote:GetStringHeight() or 0
+    detail:SetHeight(400 + (linked and 20 or 0) + math.max(0, noteHeight - 14))
 
     local met = MetLineFor(p)
     detailMet:SetText(met and (T.brass .. met .. "|r") or "")
@@ -3788,12 +5366,24 @@ local function RefreshDetailPanel()
             -- Year dropped to make room for the place; the tooltip has the full stamp.
             local when = (e.time or "?"):gsub("^%d+%-", "")
             local zoneStr = (e.zone and e.zone ~= "") and ("  " .. T.brass .. e.zone .. "|r") or ""
-            row.text:SetText(T.faint .. "#" .. num .. "|r  " .. T.light .. when .. "|r  |cFF" .. sc .. (e.source or "?") .. "|r" .. zoneStr)
+            -- In a merged history, say when it was on another character.
+            local owner = owners and owners[e]
+            local ownerStr = (owner and owner ~= p) and (ClassColor(owner.class) .. owner.name .. "|r  ") or ""
+            local roleStr = (e.role and ROLE_LABELS[e.role]) and (T.soft .. " " .. ROLE_LABELS[e.role] .. "|r") or ""
+            row.text:SetText(T.faint .. "#" .. num .. "|r  " .. ownerStr .. T.light .. when .. "|r  |cFF" .. sc .. (e.source or "?") .. "|r" .. roleStr .. zoneStr)
             local lv = ""
             if e.lvl then lv = T.soft .. "Lv " .. e.lvl .. "|r" end
             if e.myLvl then lv = lv .. (lv ~= "" and "  " or "") .. T.dim .. "you " .. e.myLvl .. "|r" end
             row.levels:SetText(lv)
             row.entry = e
+            row.owner = owner
+            -- The key of whoever this line belongs to, so "With" leaves them out.
+            row.ownerKey = key
+            if owner and owner ~= p then
+                for _, k in ipairs((People.Of(p) or {}).members or {}) do
+                    if db.players[k] == owner then row.ownerKey = k end
+                end
+            end
             row:Show()
         end
     end
@@ -3834,11 +5424,623 @@ ShowDetailPanel = function(key)
     if not key or not db or not db.players[key] then return end
     detailCurrentKey = key
     detailPage = 1
-    RefreshDetailPanel()
+    -- Shown first: a wrapped note's height is only right once it's laid out.
     detail:Show()
+    RefreshDetailPanel()
 end
 
 D("detail panel OK")
+
+----------------------------------------------------------------------
+-- People: refreshing, and the "Link to..." picker
+----------------------------------------------------------------------
+People.Changed = function()
+    RefreshList()
+    if RefreshInbox then RefreshInbox() end
+    UpdateInboxTabLabel()
+    if detail:IsShown() then RefreshDetailPanel() end
+    if Outings.recapFrame and Outings.recapFrame:IsShown() then Outings.RefreshRecap() end
+    if Outings.tabFrame and Outings.tabFrame:IsShown() and Outings.RefreshTab then Outings.RefreshTab() end
+    if ratingPicker:IsShown() then ratingPicker.Refresh() end
+end
+
+do
+    local PICK_ROWS, PICK_ROW_H = 8, 24
+    local pickKey, pickOffset, pickMatches = nil, 0, {}
+
+    local picker = CreateFrame("Frame", "WTFAYLinkPicker", UIParent)
+    picker:SetSize(340, 100 + PICK_ROWS * PICK_ROW_H + 44)
+    picker:SetPoint("CENTER", UIParent, "CENTER", 0, 40)
+    picker:SetFrameStrata("FULLSCREEN_DIALOG")
+    picker:SetMovable(true)
+    picker:EnableMouse(true)
+    picker:RegisterForDrag("LeftButton")
+    picker:SetClampedToScreen(true)
+    picker:SetScript("OnDragStart", function(s) s:StartMoving() end)
+    picker:SetScript("OnDragStop", function(s) s:StopMovingOrSizing() end)
+    picker:Hide()
+    C.SkinPanel(picker, { edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
+    picker:SetToplevel(true)
+    tinsert(UISpecialFrames, picker:GetName())
+
+    local close = CreateFrame("Button", nil, picker, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", picker, "TOPRIGHT", -2, -2)
+
+    local title = picker:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", picker, "TOPLEFT", 16, -16)
+    title:SetPoint("RIGHT", picker, "RIGHT", -30, 0)
+    title:SetJustifyH("LEFT")
+    title:SetWordWrap(false)
+
+    local hint = picker:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    hint:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
+    hint:SetText(T.dim .. "Pick another character played by the same person.|r")
+
+    local search = CreateFrame("EditBox", "WTFAYLinkPickerSearch", picker, C.SearchBoxTemplate)
+    search:SetSize(306, 22)
+    search:SetPoint("TOPLEFT", picker, "TOPLEFT", 18, -58)
+    search:SetAutoFocus(false)
+    search:SetFontObject(ChatFontNormal)
+    search:SetMaxLetters(40)
+    if search.Instructions then search.Instructions:SetText("Search players") end
+
+    local rows = {}
+    local unlinkBtn
+
+    local function Rebuild()
+        wipe(pickMatches)
+        local source = pickKey and db and db.players[pickKey]
+        if not source then return end
+        local text = (search:GetText() or ""):lower()
+        for key, p in pairs(db.players) do
+            local sameNow = (key == pickKey) or (source.personId and p.personId == source.personId)
+            if not sameNow and (text == "" or (p.name or ""):lower():find(text, 1, true)) then
+                pickMatches[#pickMatches + 1] = key
+            end
+        end
+        table.sort(pickMatches, function(a, b)
+            local pa, pb = db.players[a], db.players[b]
+            local sa, sb = pa.seen or "", pb.seen or ""
+            if sa ~= sb then return sa > sb end
+            return (pa.name or "") < (pb.name or "")
+        end)
+    end
+
+    local function Draw()
+        local maxOffset = math.max(0, #pickMatches - PICK_ROWS)
+        pickOffset = math.max(0, math.min(pickOffset, maxOffset))
+        for i, row in ipairs(rows) do
+            local key = pickMatches[pickOffset + i]
+            local p = key and db.players[key]
+            row.playerKey = key
+            if p then
+                local tag = People.Tag(p)
+                row.nameText:SetText(ClassColor(p.class) .. p.name .. "|r"
+                    .. (tag and ("  " .. T.dim .. "(" .. tag .. ")|r") or ""))
+                row.infoText:SetText(ColorRating(People.Rating(p)))
+                row:Show()
+            else
+                row:Hide()
+            end
+        end
+    end
+
+    local function Refresh()
+        Rebuild()
+        pickOffset = 0
+        Draw()
+    end
+
+    for i = 1, PICK_ROWS do
+        local row = CreateFrame("Button", nil, picker)
+        row:SetHeight(PICK_ROW_H)
+        row:SetPoint("TOPLEFT", picker, "TOPLEFT", 14, -84 - (i - 1) * PICK_ROW_H)
+        row:SetPoint("RIGHT", picker, "RIGHT", -14, 0)
+        row:EnableMouse(true)
+        row:RegisterForClicks("LeftButtonUp")
+
+        local lit = row:CreateTexture(nil, "BACKGROUND")
+        lit:SetAllPoints(row)
+        lit:SetColorTexture(1, 1, 1, 0.08)
+        lit:Hide()
+
+        row.infoText = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        row.infoText:SetPoint("RIGHT", row, "RIGHT", -6, 0)
+        row.infoText:SetJustifyH("RIGHT")
+
+        row.nameText = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        row.nameText:SetPoint("LEFT", row, "LEFT", 6, 0)
+        row.nameText:SetPoint("RIGHT", row.infoText, "LEFT", -8, 0)
+        row.nameText:SetJustifyH("LEFT")
+        row.nameText:SetWordWrap(false)
+
+        row:SetScript("OnEnter", function() lit:Show() end)
+        row:SetScript("OnLeave", function() lit:Hide() end)
+        row:SetScript("OnClick", function(self)
+            local source, target = pickKey, self.playerKey
+            if source and target then
+                picker:Hide()
+                People.LinkAndReport(source, target)
+            end
+        end)
+        rows[i] = row
+    end
+
+    picker:EnableMouseWheel(true)
+    picker:SetScript("OnMouseWheel", function(_, delta)
+        pickOffset = pickOffset - delta * (IsShiftKeyDown() and PICK_ROWS or 1)
+        Draw()
+    end)
+
+    C.HookSearchBoxChanged(search, Refresh)
+
+    unlinkBtn = CreateFrame("Button", nil, picker, C.ButtonTemplate)
+    unlinkBtn:SetSize(190, 22)
+    unlinkBtn:SetPoint("BOTTOM", picker, "BOTTOM", 0, 12)
+    unlinkBtn:SetScript("OnClick", function()
+        local key = pickKey
+        picker:Hide()
+        if key then People.UnlinkAndReport(key) end
+    end)
+
+    function People.ShowPicker(key)
+        local p = key and db and db.players[key]
+        if not p then return end
+        pickKey = key
+        title:SetText("Link " .. ClassColor(p.class) .. p.name .. "|r to:")
+        unlinkBtn:SetShown(People.Of(p) ~= nil)
+        unlinkBtn:SetText("Unlink " .. p.name)
+        search:SetText("")
+        Refresh()
+        picker:Show()
+        search:SetFocus()
+    end
+end
+
+----------------------------------------------------------------------
+-- Tags & nickname window
+--
+-- Tick tags for one character, type a nickname (saved as you type), add a
+-- tag of your own, or right-click one of yours to rename or delete it. The
+-- bottom row switches between those three jobs (add / rename / delete).
+----------------------------------------------------------------------
+do
+    local COL_W, ROW_H, TOP = 150, 22, 92
+    local pickKey
+    local mode, modeTag = "add", nil
+
+    local frame = CreateFrame("Frame", "WTFAYTagPicker", UIParent)
+    frame:SetSize(340, 240)
+    frame:SetPoint("CENTER", UIParent, "CENTER", 0, 40)
+    frame:SetFrameStrata("FULLSCREEN_DIALOG")
+    frame:SetMovable(true)
+    frame:EnableMouse(true)
+    frame:RegisterForDrag("LeftButton")
+    frame:SetClampedToScreen(true)
+    frame:SetScript("OnDragStart", function(s) s:StartMoving() end)
+    frame:SetScript("OnDragStop", function(s) s:StopMovingOrSizing() end)
+    frame:Hide()
+    C.SkinPanel(frame, { edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
+    frame:SetToplevel(true)
+    tinsert(UISpecialFrames, frame:GetName())
+
+    local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -2, -2)
+
+    local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", frame, "TOPLEFT", 16, -16)
+    title:SetPoint("RIGHT", frame, "RIGHT", -30, 0)
+    title:SetJustifyH("LEFT")
+    title:SetWordWrap(false)
+
+    local nickLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    nickLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -46)
+    nickLabel:SetText(T.soft .. "Nickname:|r")
+
+    local nickBox = CreateFrame("EditBox", "WTFAYTagPickerNick", frame, "InputBoxTemplate")
+    nickBox:SetSize(200, 20)
+    nickBox:SetPoint("LEFT", nickLabel, "RIGHT", 12, 0)
+    nickBox:SetAutoFocus(false)
+    nickBox:SetMaxLetters(32)
+    nickBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+    nickBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+
+    local tagsLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    tagsLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -72)
+    tagsLabel:SetText(T.soft .. "Tags:|r  " .. T.dim .. "(right-click one of yours to rename or delete it)|r")
+
+    local modeLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    modeLabel:SetJustifyH("LEFT")
+    local newBox = CreateFrame("EditBox", "WTFAYTagPickerNew", frame, "InputBoxTemplate")
+    newBox:SetSize(150, 20)
+    newBox:SetAutoFocus(false)
+    newBox:SetMaxLetters(Tags.MAX_LEN)
+    newBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    local actionBtn = CreateFrame("Button", nil, frame, C.ButtonTemplate)
+    actionBtn:SetSize(64, 20)
+    local cancelBtn = CreateFrame("Button", nil, frame, C.ButtonTemplate)
+    cancelBtn:SetSize(60, 20)
+    cancelBtn:SetText("Cancel")
+    local doneBtn = CreateFrame("Button", nil, frame, C.ButtonTemplate)
+    doneBtn:SetSize(80, 22)
+    doneBtn:SetPoint("BOTTOM", frame, "BOTTOM", 0, 12)
+    doneBtn:SetText("Done")
+    doneBtn:SetScript("OnClick", function() frame:Hide() end)
+
+    local checks = {}
+    local Layout, SetMode
+
+    local function Player() return pickKey and db and db.players[pickKey] end
+
+    local function Check(i)
+        if checks[i] then return checks[i] end
+        local cb = C.CreateCheckbox(frame)
+        cb:SetSize(20, 20)
+        cb:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        cb.label = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        cb.label:SetPoint("LEFT", cb, "RIGHT", 2, 0)
+        cb.label:SetWidth(COL_W - 26)
+        cb.label:SetJustifyH("LEFT")
+        cb.label:SetWordWrap(false)
+        cb:SetScript("OnClick", function(self, mouse)
+            local p = Player()
+            if not p then return end
+            if mouse == "RightButton" then
+                self:SetChecked(not self:GetChecked())   -- a right-click isn't a toggle
+                if Tags.IsCustom(self.tag) then
+                    local tag = self.tag
+                    C.ShowContextMenu(self, {
+                        { text = tag, isTitle = true },
+                        { text = "Rename...", func = function() SetMode("rename", tag) end },
+                        { text = T.off .. "Delete...|r", func = function() SetMode("delete", tag) end },
+                        { text = "Cancel" },
+                    })
+                end
+                return
+            end
+            Tags.Set(p, self.tag, self:GetChecked())
+            People.Changed()
+            Layout()
+        end)
+        cb:SetScript("OnEnter", function(self)
+            if not Tags.IsCustom(self.tag) then return end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText(self.tag, 1, 0.82, 0)
+            GameTooltip:AddLine("Your own tag. Right-click to rename or delete it.", 1, 1, 1, true)
+            GameTooltip:Show()
+        end)
+        cb:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        checks[i] = cb
+        return cb
+    end
+
+    Layout = function()
+        local p = Player()
+        if not p then return end
+        local all = Tags.All()
+        local _, whole = Tags.Of(p)   -- including linked characters'
+        for i, tag in ipairs(all) do
+            local cb = Check(i)
+            local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+            cb:ClearAllPoints()
+            cb:SetPoint("TOPLEFT", frame, "TOPLEFT", 16 + col * COL_W, -TOP - row * ROW_H)
+            cb.tag = tag
+            local own = p.tags and p.tags[tag]
+            cb:SetChecked(own and true or false)
+            local color = Tags.IsCustom(tag) and T.manual or T.light
+            cb.label:SetText(color .. tag .. "|r" .. ((not own and whole[tag]) and (T.dim .. " (alt)|r") or ""))
+            cb:Show()
+            cb.label:Show()
+        end
+        for i = #all + 1, #checks do
+            checks[i]:Hide()
+            checks[i].label:Hide()
+        end
+        local rows = math.ceil(#all / 2)
+        local y = -TOP - rows * ROW_H - 10
+        modeLabel:ClearAllPoints()
+        modeLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, y - 4)
+        newBox:ClearAllPoints()
+        newBox:SetPoint("TOPLEFT", frame, "TOPLEFT", 92, y)
+        actionBtn:ClearAllPoints()
+        if mode == "delete" then
+            -- The question takes the whole line, so its buttons go underneath.
+            actionBtn:SetPoint("TOPLEFT", modeLabel, "BOTTOMLEFT", 0, -6)
+        else
+            actionBtn:SetPoint("LEFT", newBox, "RIGHT", 6, 0)
+        end
+        cancelBtn:ClearAllPoints()
+        cancelBtn:SetPoint("LEFT", actionBtn, "RIGHT", 4, 0)
+        frame:SetHeight(-y + 64 + (mode == "delete" and 26 or 0))
+    end
+
+    SetMode = function(newMode, tag)
+        mode, modeTag = newMode, tag
+        newBox:ClearFocus()
+        if mode == "rename" then
+            modeLabel:SetText(T.soft .. "Rename to:|r")
+            newBox:SetText(tag or "")
+            newBox:Show()
+            actionBtn:SetText("Rename")
+            cancelBtn:Show()
+            newBox:SetFocus()
+            newBox:HighlightText()
+        elseif mode == "delete" then
+            local n = 0
+            for _, p in pairs(db.players) do
+                if p.tags and p.tags[tag] then n = n + 1 end
+            end
+            modeLabel:SetText(T.soft .. "Delete \"" .. tag .. "\"? It's on " .. n .. " player" .. (n == 1 and "" or "s") .. ".|r")
+            newBox:Hide()
+            actionBtn:SetText(T.off .. "Delete|r")
+            cancelBtn:Show()
+        else
+            mode, modeTag = "add", nil
+            modeLabel:SetText(T.soft .. "New tag:|r")
+            newBox:SetText("")
+            newBox:Show()
+            actionBtn:SetText("Add")
+            cancelBtn:Hide()
+        end
+        Layout()
+    end
+
+    local function DoAction()
+        local p = Player()
+        if not p then return end
+        if mode == "add" then
+            local tag, why = Tags.AddCustom(newBox:GetText())
+            if not tag then
+                if why ~= "empty" then P("Can't add that tag: " .. why .. ".") end
+                return
+            end
+            Tags.Set(p, tag, true)
+            P("New tag " .. T.manual .. tag .. "|r added to " .. p.name .. ".")
+        elseif mode == "rename" then
+            local ok, why = Tags.Rename(modeTag, newBox:GetText())
+            if not ok then P("Can't rename that tag: " .. why .. "."); return end
+            P("Tag renamed everywhere it was used.")
+        elseif mode == "delete" then
+            local n = Tags.Remove(modeTag)
+            P("Tag " .. T.manual .. modeTag .. "|r deleted (" .. n .. " player" .. (n == 1 and "" or "s") .. ").")
+        end
+        -- A renamed or deleted tag can't stay the list filter.
+        if mode ~= "add" and listFilters.tag == modeTag then
+            listFilters.tagBtn.idx = 1
+            listFilters.tagBtn:Show1()
+        end
+        SetMode("add")
+        People.Changed()
+    end
+    actionBtn:SetScript("OnClick", DoAction)
+    newBox:SetScript("OnEnterPressed", DoAction)
+    cancelBtn:SetScript("OnClick", function() SetMode("add") end)
+
+    nickBox:SetScript("OnTextChanged", function(self, userInput)
+        local p = Player()
+        if not (userInput and p) then return end
+        Tags.SetNick(p, self:GetText())
+        People.Changed()
+    end)
+
+    function Tags.ShowPicker(key)
+        local p = key and db and db.players[key]
+        if not p then return end
+        pickKey = key
+        title:SetText("Tags for " .. ClassColor(p.class) .. p.name .. "|r")
+        nickBox:SetText(p.nick or "")
+        SetMode("add")
+        frame:Show()
+    end
+    Tags.pickerFrame = frame
+end
+
+----------------------------------------------------------------------
+-- Rate-your-group card
+--
+-- Everyone from one group, each with a row of rating buttons, so a whole
+-- dungeon can be rated in a few clicks. Opens by itself when a group ends
+-- (if "Rate Your Group Afterwards" is on, and never during combat), from
+-- the Groups tab, or with /wtfay recap.
+----------------------------------------------------------------------
+do
+    local MAX_ROWS, ROW_H, BTN = 10, 24, 18
+    local recapId
+
+    local card = CreateFrame("Frame", "WTFAYRecap", UIParent)
+    card:SetSize(420, 120)
+    card:SetPoint("CENTER", UIParent, "CENTER", 0, 80)
+    -- DIALOG like the main window (so it opens on top of the Groups tab) and
+    -- not FULLSCREEN_DIALOG, so the note popups it opens can draw above it.
+    card:SetFrameStrata("DIALOG")
+    card:SetMovable(true)
+    card:EnableMouse(true)
+    card:RegisterForDrag("LeftButton")
+    card:SetClampedToScreen(true)
+    card:SetScript("OnDragStart", function(s) s:StartMoving() end)
+    card:SetScript("OnDragStop", function(s) s:StopMovingOrSizing() end)
+    card:Hide()
+    C.SkinPanel(card, { edgeSize = 24, insets = { left = 6, right = 6, top = 6, bottom = 6 } })
+    card:SetToplevel(true)
+    tinsert(UISpecialFrames, card:GetName())
+
+    local close = CreateFrame("Button", nil, card, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", card, "TOPRIGHT", -2, -2)
+
+    local title = card:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", card, "TOPLEFT", 16, -14)
+    title:SetText("|cFF" .. ACCENT .. "Rate your group|r")
+    local sub = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    sub:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -3)
+    sub:SetPoint("RIGHT", card, "RIGHT", -30, 0)
+    sub:SetJustifyH("LEFT")
+    sub:SetWordWrap(false)
+
+    local more = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    -- When the card pops up by itself, say how to stop it doing that.
+    local hint = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    hint:SetPoint("BOTTOMLEFT", card, "BOTTOMLEFT", 16, 42)
+    hint:SetPoint("RIGHT", card, "RIGHT", -16, 0)
+    hint:SetJustifyH("LEFT")
+    hint:SetText(T.dim .. "Opens whenever a group ends. Turn it off under Settings > General > Rate Your Group Afterwards.|r")
+    local auto = false
+    local noteBtn = CreateFrame("Button", nil, card, C.ButtonTemplate)
+    noteBtn:SetSize(90, 22)
+    noteBtn:SetPoint("BOTTOMLEFT", card, "BOTTOMLEFT", 14, 12)
+    noteBtn:SetText("Group Note")
+    noteBtn:SetScript("OnClick", function()
+        Outings.editingId = recapId
+        StaticPopup_Show("WTFAY_EDIT_GROUP_NOTE")
+    end)
+    local doneBtn = CreateFrame("Button", nil, card, C.ButtonTemplate)
+    doneBtn:SetSize(80, 22)
+    doneBtn:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -14, 12)
+    doneBtn:SetText("Done")
+    doneBtn:SetScript("OnClick", function() card:Hide() end)
+
+    local rows = {}
+
+    local function PaintRow(row)
+        local p = row.playerKey and db.players[row.playerKey]
+        if not p then return end
+        local current = People.Rating(p)
+        local nick = Tags.Nick(p)
+        row.name:SetText(ClassColor(p.class) .. p.name .. "|r"
+            .. (nick and (" " .. T.soft .. "\"" .. nick .. "\"|r") or "")
+            .. (p.pending and (" " .. T.warn .. "new|r") or ""))
+        for _, b in ipairs(row.buttons) do
+            local on = (not p.pending) and b.value == current
+            b.bg:SetAlpha(on and 1 or 0.45)
+            b.label:SetText((on and T.white or T.soft) .. (b.value > 0 and "+" or "") .. b.value .. "|r")
+        end
+    end
+
+    local function Row(i)
+        if rows[i] then return rows[i] end
+        local row = CreateFrame("Frame", nil, card)
+        row:SetHeight(ROW_H)
+        row:SetPoint("TOPLEFT", card, "TOPLEFT", 14, -46 - (i - 1) * ROW_H)
+        row:SetPoint("RIGHT", card, "RIGHT", -14, 0)
+        row.name = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        row.name:SetPoint("LEFT", row, "LEFT", 0, 0)
+        row.name:SetWidth(150)
+        row.name:SetJustifyH("LEFT")
+        row.name:SetWordWrap(false)
+        row.buttons = {}
+        for v = -3, 5 do
+            local b = CreateFrame("Button", nil, row)
+            b:SetSize(BTN, BTN)
+            b:SetPoint("LEFT", row, "LEFT", 154 + (v + 3) * (BTN + 2), 0)
+            b.bg = b:CreateTexture(nil, "BACKGROUND")
+            b.bg:SetAllPoints()
+            local r, g
+            if v < 0 then r, g = 1.0, ((v + 3) / 3) * 0.6 else r, g = 1.0 - (v / 5) * 0.7, 0.5 + (v / 5) * 0.5 end
+            if b.bg.SetColorTexture then b.bg:SetColorTexture(r, g, 0, 0.9) else b.bg:SetTexture(r, g, 0, 0.9) end
+            b.label = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            b.label:SetPoint("CENTER")
+            b.value = v
+            b:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_TOP")
+                GameTooltip:SetText((self.value > 0 and "+" or "") .. self.value .. "  " .. (RATING_LABELS[self.value] or ""), 1, 1, 1)
+                GameTooltip:Show()
+            end)
+            b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            b:SetScript("OnClick", function(self)
+                local p = row.playerKey and db.players[row.playerKey]
+                if not p then return end
+                People.SetRating(p, self.value)
+                p.pending = nil
+                People.Changed()
+                -- Linked characters share a rating, so repaint every row.
+                for _, other in ipairs(rows) do
+                    if other:IsShown() then PaintRow(other) end
+                end
+            end)
+            row.buttons[#row.buttons + 1] = b
+        end
+        row.noteBtn = CreateFrame("Button", nil, row, C.ButtonTemplate)
+        row.noteBtn:SetSize(44, 18)
+        row.noteBtn:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+        row.noteBtn:SetText("Note")
+        row.noteBtn:SetNormalFontObject(GameFontNormalSmall)
+        row.noteBtn:SetScript("OnClick", function()
+            local p = row.playerKey and db.players[row.playerKey]
+            if not p then return end
+            popupActiveKey = row.playerKey
+            StaticPopup_Show("WTFAY_EDIT_NOTE", p.name)
+        end)
+        rows[i] = row
+        return row
+    end
+
+    function Outings.RefreshRecap()
+        local o = Outings.Get(recapId)
+        if not o then card:Hide(); return end
+        local info = SOURCE_INFO[o.kind] or SOURCE_INFO.group
+        local where = Outings.Where(o, 2)
+        sub:SetText(T.light .. (o.time or "?") .. "|r  |cFF" .. info.color .. info.label .. "|r  "
+            .. T.dim .. Outings.Duration(o) .. "|r" .. (where ~= "" and ("  " .. T.brass .. where .. "|r") or "")
+            .. (o.note and ("  " .. T.dim .. "- " .. o.note .. "|r") or ""))
+        local _, keys = Outings.Members(o)
+        local shown = math.min(#keys, MAX_ROWS)
+        for i = 1, shown do
+            local row = Row(i)
+            row.playerKey = keys[i]
+            PaintRow(row)
+            row:Show()
+        end
+        for i = shown + 1, #rows do rows[i]:Hide() end
+        more:ClearAllPoints()
+        more:SetPoint("TOPLEFT", card, "TOPLEFT", 16, -50 - shown * ROW_H)
+        if #keys > MAX_ROWS then
+            more:SetText(T.dim .. "+" .. (#keys - MAX_ROWS) .. " more - right-click this group in the Groups tab and choose Show Players.|r")
+        elseif #keys == 0 then
+            more:SetText(T.dim .. "None of this group's players are in your database any more.|r")
+        else
+            more:SetText("")
+        end
+        hint:SetShown(auto)
+        card:SetHeight(46 + math.max(shown, 1) * ROW_H + ((#keys > MAX_ROWS or #keys == 0) and 18 or 0) + 46
+            + (auto and 30 or 0))
+    end
+
+    -- opened: it popped up by itself because a group ended, so show the hint.
+    function Outings.ShowRecap(id, opened)
+        if not Outings.Get(id) then
+            P("No group to rate yet - they're saved as you group with people.")
+            return
+        end
+        recapId = id
+        auto = opened and true or false
+        Outings.RefreshRecap()
+        card:Show()
+        card:Raise()
+    end
+
+    -- Shown when a group ends: a moment later (so a loading screen can pass),
+    -- and only once you're out of combat.
+    local waiter = CreateFrame("Frame")
+    waiter:SetScript("OnEvent", function(self)
+        self:UnregisterEvent("PLAYER_REGEN_ENABLED")
+        if self.pending then
+            local id = self.pending
+            self.pending = nil
+            Outings.ShowRecap(id, true)
+        end
+    end)
+    function Outings.QueueRecap(id)
+        C_Timer.After(2, function()
+            if not Outings.Get(id) or #(Outings.Members(Outings.Get(id))) == 0 then return end
+            if InCombatLockdown and InCombatLockdown() then
+                waiter.pending = id
+                waiter:RegisterEvent("PLAYER_REGEN_ENABLED")
+                return
+            end
+            Outings.ShowRecap(id, true)
+        end)
+    end
+    Outings.recapFrame = card
+end
 
 ----------------------------------------------------------------------
 -- Core API
@@ -3886,6 +6088,7 @@ local function RemovePlayer(nameRealm)
     local key = MakeKey(name, realm)
 
     if db.players[key] then
+        People.Unlink(key)
         db.players[key] = nil
         P("Removed " .. T.dangerSoft .. name .. "|r")
         RefreshList()
@@ -3900,7 +6103,7 @@ local function SearchPlayers(query)
     for key, p in pairs(db.players) do
         if p.name:lower():find(query, 1, true) or (p.note or ""):lower():find(query, 1, true) then
             local cc = ClassColor(p.class)
-            P(cc .. p.name .. "|r  " .. ColorRating(p.rating) .. "  " .. T.muted .. (p.note or "") .. "|r")
+            P(cc .. p.name .. "|r  " .. ColorRating(People.Rating(p)) .. "  " .. T.muted .. (p.note or "") .. "|r")
             found = found + 1
         end
     end
@@ -3921,7 +6124,7 @@ local function RatePlayer(nameRealm, rating)
         return
     end
     rating = math.max(-3, math.min(5, math.floor(rating)))
-    db.players[key].rating = rating
+    People.SetRating(db.players[key], rating)
     if db.players[key].pending then db.players[key].pending = nil end
     P(ClassColor(db.players[key].class) .. name .. "|r rated " .. ColorRating(rating))
     RefreshList()
@@ -4151,6 +6354,15 @@ local HELP_TEXT = {
     "  " .. T.gold .. "/wtfay note Name Some text|r - Set a note on a player",
     "  " .. T.gold .. "/wtfay search term|r - Search players by name",
     " ",
+    "|cFF" .. ACCENT .. "Same player, several characters:|r",
+    "  " .. T.gold .. "/wtfay link Alt, Main|r - Link two characters (they share one rating)",
+    "  " .. T.gold .. "/wtfay unlink Name|r - Undo a link (their own rating comes back)",
+    "  " .. T.gold .. "/wtfay main Name|r - Make a linked character the main",
+    " ",
+    "|cFF" .. ACCENT .. "Groups:|r",
+    "  " .. T.gold .. "/wtfay groups|r - Every group you've been in, with who was there",
+    "  " .. T.gold .. "/wtfay recap|r - Rate everyone from your last group",
+    " ",
     "|cFF" .. ACCENT .. "Data:|r",
     "  " .. T.gold .. "/wtfay export|r - Export your database to share with friends",
     "  " .. T.gold .. "/wtfay import|r - Import a database (merge or replace)",
@@ -4165,7 +6377,8 @@ local HELP_TEXT = {
     "  " .. T.gold .. "/wtfay debug|r - Toggle debug logging",
     " ",
     T.dim .. "Tips: Left-click a player row for details. Right-click for context menu.|r",
-    T.dim .. "Use the filters at the top to narrow by rating, source, or class.|r",
+    T.dim .. "Use the filters at the top to narrow by rating, class, tag, source, or when you last saw them.|r",
+    T.dim .. "Right-click a player for Tags & Nickname. Search finds nicknames and tags too.|r",
     T.dim .. "Right-click a player anywhere in the UI for \"WTFAY: Rate / Note\".|r",
     T.dim .. "Click the minimap icon to quickly open WTFAY.|r",
     "|cFF" .. ACCENT .. "=================================================|r",
@@ -4194,7 +6407,9 @@ SlashCmdList["WTFAY"] = function(msg)
         if rest ~= "" then RemovePlayer(rest) else P("Usage: /wtfay remove PlayerName") end
 
     elseif cmd == "rate" then
-        local target, val = rest:match("^(%S+)%s+([%-]?%d+)")
+        local target, val = rest:match("^([^%s,]+)[%s,]+([%-]?%d+)")
+        -- Forever names contain a space, so there the number is the last word.
+        if not target then target, val = rest:match("^(.-[^%s,])[%s,]+([%-]?%d+)$") end
         if target and val then
             RatePlayer(target, tonumber(val))
         else
@@ -4202,8 +6417,18 @@ SlashCmdList["WTFAY"] = function(msg)
         end
 
     elseif cmd == "note" then
-        local target, noteText = rest:match("^(%S+)%s+(.*)")
-        if target and noteText then
+        -- Forever names contain a space, so the name runs up to the longest known
+        -- player. A comma only ends it there too: notes can contain commas.
+        local target, noteText = rest:match("^([^%s,]+)[%s,]+(.*)")
+        for pos in rest:gmatch("()[%s,]+[^%s,]") do
+            local prefix = rest:sub(1, pos - 1)
+            if db.players[MakeKey(SplitNameRealm(prefix))] then
+                target, noteText = prefix, rest:sub(pos):match("^[%s,]*(.*)")
+            end
+        end
+        -- Just a name and no note: don't read the surname as the note.
+        if db.players[MakeKey(SplitNameRealm(rest))] then target = nil end
+        if target and noteText and noteText ~= "" then
             NotePlayer(target, noteText)
         else
             P("Usage: /wtfay note PlayerName Some text here")
@@ -4230,22 +6455,66 @@ SlashCmdList["WTFAY"] = function(msg)
             P("Queued " .. T.gold .. n .. "|r player(s) for /who lookup (~5s apart).")
         end
 
+    elseif cmd == "link" then
+        -- A comma is the separator, because Forever names contain spaces.
+        local a, b = rest:match("^(.-)%s*,%s*(.+)$")
+        if not a then a, b = rest:match("^(%S+)%s+(%S+)$") end
+        if not a or a == "" then
+            P("Usage: /wtfay link Alt, Main")
+        else
+            local keyA, keyB = People.Find(a), People.Find(b)
+            if not keyA or not keyB then
+                P("Player " .. T.white .. (keyA and b or a) .. "|r not found, or more than one match. Add them first: " .. T.gold .. "/wtfay add|r")
+            else
+                People.LinkAndReport(keyA, keyB)
+            end
+        end
+
+    elseif cmd == "unlink" then
+        local key = People.Find(rest)
+        if rest == "" then
+            P("Usage: /wtfay unlink Name")
+        elseif not key then
+            P("Player " .. T.white .. rest .. "|r not found, or more than one match.")
+        else
+            People.UnlinkAndReport(key)
+        end
+
+    elseif cmd == "main" then
+        local key = People.Find(rest)
+        if rest == "" then
+            P("Usage: /wtfay main Name")
+        elseif not key then
+            P("Player " .. T.white .. rest .. "|r not found, or more than one match.")
+        elseif People.SetMain(key) then
+            P(T.white .. db.players[key].name .. "|r is now the main character.")
+            People.Changed()
+        else
+            P(T.white .. db.players[key].name .. "|r isn't linked to anyone.")
+        end
+
+    elseif cmd == "recap" then
+        -- Rate everyone from your last group (or the one you're in).
+        Outings.ShowRecap(Outings.currentId or Outings.Latest())
+
+    elseif cmd == "groups" then
+        ShowMainTab("Groups")
+        f:Show()
+
     elseif cmd == "search" or cmd == "find" then
         if rest ~= "" then SearchPlayers(rest) else P("Usage: /wtfay search term") end
 
     elseif cmd == "help" or cmd == "?" then
         for _, line in ipairs(HELP_TEXT) do P(line) end
 
-    elseif cmd == "reseed" then
-        ReseedDB()
-        RefreshList()
-        P("Re-seeded fake player data.")
-
     elseif cmd == "reset" then
         wipe(db.players)
-        ReseedDB()
+        wipe(db.people)
+        wipe(db.outings)
+        db.lastOuting, Outings.currentId = nil, nil
         RefreshList()
-        P("Database wiped and re-seeded with 12 fake players.")
+        if Outings.RefreshTab then Outings.RefreshTab() end
+        P("Database wiped.")
 
     elseif cmd == "debug" then
         DEBUG = not DEBUG
@@ -4284,6 +6553,9 @@ SlashCmdList["WTFAY"] = function(msg)
                     end
                 end
             end
+            -- Backups made before links existed have no people.
+            db.people = bk.people or {}
+            People.Reconcile()
             table.remove(db.backups, 1)
             P("Restored backup from " .. T.gold .. (bk.time or "?") .. "|r (" .. count .. " players). " .. #db.backups .. " backup(s) remaining.")
             RefreshList()
@@ -4401,7 +6673,7 @@ local function ShowAlertPopup(knownPlayers, isLeave)
     -- Count blacklisted
     local blacklistCount = 0
     for _, kp in ipairs(knownPlayers) do
-        if kp.player.rating and kp.player.rating <= -3 then
+        if People.Rating(kp.player) <= -3 then
             blacklistCount = blacklistCount + 1
         end
     end
@@ -4457,18 +6729,17 @@ local function ShowAlertPopup(knownPlayers, isLeave)
         line:SetPoint("RIGHT", alertPopupFrame, "RIGHT", -14, 0)
 
         local cc = ClassColor(p.class)
-        local ratingStr = C.RatingIcon(p.rating or 0) .. ColorRating(p.rating or 0)
+        local ratingStr = C.RatingIcon(People.Rating(p)) .. ColorRating(People.Rating(p))
         local prefix = ""
-        if p.rating and p.rating <= -3 then
+        if People.Rating(p) <= -3 then
             prefix = T.blacklist .. "[BLACKLISTED]|r  "
         end
         line.nameText:SetText(prefix .. cc .. p.name .. "|r  " .. cc .. (p.class or "") .. "|r  Lv " .. (p.level or "?") .. "  Rating: " .. ratingStr)
 
-        if p.note and p.note ~= "" then
-            line.noteText:SetText(T.soft .. "\"" .. p.note .. "\"|r")
-        else
-            line.noteText:SetText("")
-        end
+        local personTag = People.Tag(p)
+        local bestNote = People.BestNote(p)
+        line.noteText:SetText((personTag and (T.dim .. "(" .. personTag .. ")|r  ") or "")
+            .. (bestNote and (T.soft .. "\"" .. bestNote .. "\"|r") or ""))
 
         line:Show()
         yOffset = yOffset - lineHeight
@@ -4521,6 +6792,10 @@ local function GetGroupSourceAndZone()
             return "raid", zoneName
         elseif instanceType == "party" then
             return "dungeon", zoneName
+        elseif instanceType == "pvp" or instanceType == "arena" then
+            -- Battleground and arena groups are strangers queued together:
+            -- ScanGroupMembers records nothing for them.
+            return "pvp", zoneName
         else
             return "group", zoneName
         end
@@ -4557,12 +6832,15 @@ local function FireAlert(players, title, isLeave)
     for _, kp in ipairs(players) do
         local p = kp.player
         local cc = ClassColor(p.class)
-        local ratingStr = ColorRating(p.rating or 0)
-        local noteStr = (p.note and p.note ~= "") and ("  " .. T.soft .. "\"" .. p.note .. "\"|r") or ""
-        if p.rating and p.rating <= -3 then
-            P("  " .. T.blacklist .. ">>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+        local ratingStr = ColorRating(People.Rating(p))
+        local bestNote = People.BestNote(p)
+        local noteStr = bestNote and ("  " .. T.soft .. "\"" .. bestNote .. "\"|r") or ""
+        local personTag = People.Tag(p)
+        local tagStr = personTag and (T.dim .. " (" .. personTag .. ")|r") or ""
+        if People.Rating(p) <= -3 then
+            P("  " .. T.blacklist .. ">>> BLACKLISTED <<<|r  " .. cc .. p.name .. "|r" .. tagStr .. " (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
         else
-            P("  " .. cc .. p.name .. "|r (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
+            P("  " .. cc .. p.name .. "|r" .. tagStr .. " (" .. cc .. (p.class or "?") .. "|r) " .. ratingStr .. noteStr)
         end
     end
     if db.settings.alertPopup then
@@ -4570,7 +6848,7 @@ local function FireAlert(players, title, isLeave)
     else
         local hasBlacklist = false
         for _, kp in ipairs(players) do
-            if kp.player.rating and kp.player.rating <= -3 then hasBlacklist = true; break end
+            if People.Rating(kp.player) <= -3 then hasBlacklist = true; break end
         end
         PlayAlertSound(hasBlacklist)
     end
@@ -4583,6 +6861,12 @@ local function ScanGroupMembers()
         -- Left group: reset alert state so next join triggers fresh
         lastAlertSet = {}
         lastScanMembers = nil
+        autoTracker.grouped = nil
+        -- The group is over: offer to rate who was in it (a setting, on by default).
+        local _, endedId = Outings.Close()
+        if endedId and db.settings.groupRecap and Outings.QueueRecap then
+            Outings.QueueRecap(endedId)
+        end
         local inboxCount = GetInboxCount()
         if inboxCount > 0 then
             P(T.warn .. inboxCount .. "|r player" .. (inboxCount == 1 and "" or "s") .. " in your inbox to review. Type " .. T.gold .. "/wtfay|r to open.")
@@ -4594,10 +6878,39 @@ local function ScanGroupMembers()
     end
 
     local source, zone = GetGroupSourceAndZone()
+    -- Battlegrounds and arenas: no players, no encounters, no alerts. Your own
+    -- party (if you queued with one) picks up again when you're back out.
+    if source == "pvp" then
+        D("ScanGroupMembers: in a battleground/arena, not recording")
+        return
+    end
     local myName = C.UnitIdentity("player") or ""
     local numMembers
     local knownPlayers = {}  -- collect known players for alerts
     local guildSet = nil     -- lazy-loaded
+    -- Everyone grouped at the previous scan: they're still on the same outing,
+    -- so zoning around together doesn't log a new encounter each time.
+    local wasGrouped = autoTracker.grouped or {}
+    local nowGrouped = {}
+    autoTracker.grouped = nowGrouped
+
+    -- Who's here, before anything is logged, so the outing knows its members.
+    local units = {}
+    if IsInRaid() then
+        numMembers = GetNumRaidMembers and GetNumRaidMembers() or GetNumGroupMembers() or 0
+        for i = 1, numMembers do units[#units + 1] = "raid" .. i end
+    else
+        numMembers = GetNumPartyMembers and GetNumPartyMembers() or (GetNumGroupMembers and GetNumGroupMembers() or 0)
+        for i = 1, numMembers do units[#units + 1] = "party" .. i end
+    end
+    do
+        local keys = {}
+        for _, unit in ipairs(units) do
+            local key, name = UnitKey(unit)
+            if key and name ~= myName then keys[key] = true end
+        end
+        Outings.Touch(keys, source, zone or (GetRealZoneText and GetRealZoneText()) or nil)
+    end
 
     -- Helper: process a single unit
     local function ProcessUnit(unit)
@@ -4607,8 +6920,10 @@ local function ScanGroupMembers()
         local className = classFile and TitleCase(classFile) or "Unknown"
         local raceName = UnitRace(unit) or ""
         local level = UnitLevel(unit) or 0
+        local role = C.UnitRole(unit)
         local key = MakeKey(name, realm)
         local wasKnown = db.players[key] ~= nil
+        nowGrouped[key] = true
 
         if wasKnown then
             local p = db.players[key]
@@ -4617,7 +6932,7 @@ local function ScanGroupMembers()
             if raceName ~= "" then p.race = raceName end
             if level > 0 and level > (p.level or 0) then p.level = level end
             p.source = source
-            LogEncounter(key, source, zone, level)
+            LogEncounter(key, source, zone, level, nil, wasGrouped[key], role)
         else
             db.players[key] = {
                 name = name, realm = realm, class = className,
@@ -4625,7 +6940,7 @@ local function ScanGroupMembers()
                 note = "", source = source, seen = Timestamp(),
                 encounters = {}, pending = true,
             }
-            LogEncounter(key, source, zone, level)
+            LogEncounter(key, source, zone, level, nil, nil, role)
             D("New player added to inbox: " .. name)
             P(ClassColor(className) .. name .. "|r added to inbox.")
             UpdateInboxTabLabel()
@@ -4646,13 +6961,7 @@ local function ScanGroupMembers()
         end
     end
 
-    if IsInRaid() then
-        numMembers = GetNumRaidMembers and GetNumRaidMembers() or GetNumGroupMembers() or 0
-        for i = 1, numMembers do ProcessUnit("raid" .. i) end
-    else
-        numMembers = GetNumPartyMembers and GetNumPartyMembers() or (GetNumGroupMembers and GetNumGroupMembers() or 0)
-        for i = 1, numMembers do ProcessUnit("party" .. i) end
-    end
+    for _, unit in ipairs(units) do ProcessUnit(unit) end
 
     D("ScanGroupMembers: source=" .. source .. " zone=" .. tostring(zone) .. " members=" .. tostring(numMembers))
 
@@ -4724,9 +7033,10 @@ autoTracker:SetScript("OnEvent", function(self, event)
     if not db or not db.settings or not db.settings.autoTrack then return end
 
     if event == "ZONE_CHANGED_NEW_AREA" then
-        -- Only scan if we're in a group AND just entered an instance
-        local inInstance = IsInInstance()
-        if inInstance and (IsInGroup() or IsInRaid()) then
+        -- Any zone change while grouped: entering an instance starts its own
+        -- encounter line, and the group's record collects the places visited.
+        -- Zoning around together only extends existing entries (LogEncounter).
+        if IsInGroup() or IsInRaid() then
             -- Small delay to let unit info populate
             C_Timer.After(2, ScanGroupMembers)
         end
@@ -4752,7 +7062,16 @@ D("auto-tracking system OK")
 ----------------------------------------------------------------------
 do
     local menuOK, menuErr, impl = C.RegisterUnitMenu(
-        "WTFAY: Rate / Note",
+        -- Someone you've already rated shows that rating instead of a bare "Rate".
+        function(name, realm)
+            local p = name and db and db.players and db.players[MakeKey(name, realm)]
+            if not p or p.pending then return "Rate / Note" end
+            local r = People.Rating(p)
+            local tag = People.Tag(p)
+            return ColorRating(r) .. " " .. (RATING_LABELS[r] or "")
+                .. (tag and (" " .. T.dim .. "(" .. tag .. ")|r") or "")
+                .. "  -  Change / Note"
+        end,
         function(name, realm, unit)
             if not db or not db.players then return end
             if not name or name == "" then return end
@@ -4859,7 +7178,7 @@ loader:SetScript("OnEvent", function(self, event, arg1)
         if db.sortDirection then sortDirection = db.sortDirection end
         UpdateHeaderArrows()
 
-        D("DB initialized, " .. (db.seeded and "already seeded" or "freshly seeded"))
+        D("DB initialized")
         local count = 0
         for _ in pairs(db.players) do count = count + 1 end
         D("player count: " .. count)
@@ -4949,11 +7268,26 @@ local tooltipOK, tooltipErr = C.HookUnitTooltip(function(tooltip, unit)
         tooltip:AddLine(" ")
         tooltip:AddDoubleLine(
             "|cFF" .. ACCENT .. "WTFAY|r",
-            C.RatingIcon(p.rating or 0) .. ColorRating(p.rating or 0) .. " " .. (RATING_LABELS[p.rating or 0] or "")
+            C.RatingIcon(People.Rating(p)) .. ColorRating(People.Rating(p)) .. " " .. (RATING_LABELS[People.Rating(p)] or "")
         )
-        if p.note and p.note ~= "" then
-            tooltip:AddLine(T.text .. p.note .. "|r", 1, 1, 1, true)
+        local personLine = People.Line(p)
+        if personLine then tooltip:AddLine(T.accent .. personLine .. "|r") end
+        -- Notes, tags and nicknames are yours alone; this setting keeps them
+        -- off a streamed or shared screen.
+        if db.settings.tooltipNotes then
+            local nick = Tags.Nick(p)
+            if nick then tooltip:AddLine(T.soft .. "\"" .. nick .. "\"|r") end
+            local tagText = Tags.Text(p)
+            if tagText then tooltip:AddLine(T.manual .. tagText .. "|r", 1, 1, 1, true) end
+            if p.note and p.note ~= "" then
+                tooltip:AddLine(T.text .. p.note .. "|r", 1, 1, 1, true)
+            end
+            for _, other in ipairs(People.OtherNotes(p)) do
+                tooltip:AddLine(T.dim .. other.name .. ": |r" .. T.text .. other.note .. "|r", 1, 1, 1, true)
+            end
         end
+        local roles = People.RoleSummary(p)
+        if roles then tooltip:AddLine(T.soft .. "Played: " .. roles .. "|r") end
         if db.settings.tooltipGuild and p.guild and p.guild ~= "" then
             tooltip:AddLine(T.guild .. "<" .. p.guild .. ">|r")
         end
