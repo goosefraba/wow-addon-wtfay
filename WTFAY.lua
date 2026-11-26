@@ -1,5 +1,5 @@
 ----------------------------------------------------------------------
--- WTFAY - Who The F* Are You?   v0.9.0
+-- WTFAY - Who The F* Are You?   v0.9.1
 -- Database, slash commands, browse UI, rating, notes
 --
 -- Multi-flavor: TBC Anniversary (20506), WoW Forever (16001) and Midnight
@@ -10,7 +10,7 @@ local ADDON_NAME, ns = ...
 local C = ns.C
 local T = C.T   -- text colour tokens; never write a raw |cFF literal
 
-local ADDON_VERSION = "0.9.0"
+local ADDON_VERSION = "0.9.1"
 local ACCENT     = "00CCFF"
 local PREFIX     = "|cFF" .. ACCENT .. "[WTFAY]|r "
 local DEBUG      = false  -- overridden by db.settings.debug after ADDON_LOADED
@@ -3087,11 +3087,14 @@ do
             end
             return entries
         end)
-        dd:SetPoint("LEFT", soundLabel, "RIGHT", -8, -2)
+        -- The classic dropdown's empty padding needs pulling in; the Mainline
+        -- button has none and would overlap the label and the Test button.
+        local padded = dd.padded
+        dd:SetPoint("LEFT", soundLabel, "RIGHT", padded and -8 or 8, padded and -2 or 0)
 
         local previewBtn = CreateFrame("Button", nil, parent, C.ButtonTemplate)
         previewBtn:SetSize(40, 22)
-        previewBtn:SetPoint("LEFT", dd, "RIGHT", -4, 2)
+        previewBtn:SetPoint("LEFT", dd, "RIGHT", padded and -4 or 6, padded and 2 or 0)
         previewBtn:SetText("Test")
         previewBtn:SetScript("OnClick", function()
             local idx = db and db.settings and db.settings.alertSoundChoice or 1

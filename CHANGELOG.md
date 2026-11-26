@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.9.1
+
+### Bug Fixes
+- Fixed the alert sound picker overlapping its "Sound" label and the Test button in the settings on WoW Forever and Midnight.
+
 ## v0.9.0
 
 ### New Features

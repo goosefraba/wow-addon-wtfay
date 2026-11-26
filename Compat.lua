@@ -497,6 +497,9 @@ function C.CreateDropdown(parent, width, buildEntries)
         end
     end)
     dd.SetLabel = function(self, text) UIDropDownMenu_SetText(self, text) end
+    -- The classic template has ~16px of empty frame on each side, so callers
+    -- anchor it with negative offsets; the Mainline button has none.
+    dd.padded = true
     return dd
 end
 
